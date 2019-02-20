@@ -1,12 +1,3 @@
-/*
-	Name: cvCard
-	Description: Responsive HTML5 vCard Template
-	Version: 1.2.2
-	Author: pixelwars
-*/
-
-
-
 /* global variables */
 var classicLayout = false;
 var portfolioKeyword;
@@ -263,7 +254,7 @@ var $container, $blog_container;
 			}
 		  
 		}
-		google.maps.event.addDomListener(window, 'load', initializeMap);
+		// google.maps.event.addDomListener(window, 'load', initializeMap);
 		// ------------------------------
 		
 		
