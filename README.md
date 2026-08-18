@@ -1,74 +1,75 @@
 # ankuranand.com
 
-The personal site and writing archive of Ankur Anand. It is built with Astro,
-stores articles as Markdown/MDX, and publishes static HTML to GitHub Pages.
+## Run locally
 
-## Local development
-
-Requires Node.js 22.12 or newer.
+1. Install Node.js 22.12 or newer.
+2. Install dependencies and start Astro:
 
 ```sh
 npm install
 npm run dev
 ```
 
-Before publishing a change:
+3. Validate a production build:
 
 ```sh
 npm run build
 ```
 
-## Publishing an article
+## Publish an article
 
-1. Copy `templates/post.mdx` to `src/content/blog/<article-slug>.mdx`.
-2. Fill in the frontmatter and write the article.
-3. Keep `draft: true` until it is ready.
-4. Run `npm run build` to validate metadata, links, and generated pages.
-5. Set `draft: false` and merge the change into `master`.
+1. Create a dated draft and answer the metadata prompts:
 
-The deployment workflow publishes the generated `dist/` directory. In the
-repository's GitHub Pages settings, the publishing source must be set to
-**GitHub Actions**.
+```sh
+make new-article
+```
 
-## Homepage projects
+2. Write the article and keep `draft: true` while working.
+3. Validate it with `make build`.
+4. Publish it:
 
-Edit `src/data/projects.txt` to add, remove, reorder, or rewrite showcased
-projects. Each non-comment line uses this format:
+```sh
+make publish-article POST=src/content/blog/YYYY/MM/DD/article-slug.mdx
+```
+
+The publish command sets `draft: false`, runs the complete production build,
+stages only the article and `public/images/blog/<article-slug>/` when present,
+commits them, and pushes `master`.
+
+## Edit homepage projects
+
+1. Edit `src/data/projects.txt`.
+2. Add one project per line:
 
 ```text
 Project name | A short description | https://github.com/owner/repository
 ```
 
-## SEO and the imported archive
+3. Reorder lines to change the homepage order.
+4. Run `npm run build`.
 
-The site generates canonical links, Open Graph and social metadata,
-`BlogPosting` structured data, RSS, `robots.txt`, and XML sitemaps. The imported
-articles are currently reading mirrors rather than a domain migration:
+## Set article canonical URLs
 
-- every article available on Medium keeps Medium as its canonical source;
-- each legacy-only article keeps its `blog.ankuranand.com` canonical source;
-- mirrored `ankuranand.com/blog/...` URLs are excluded from the XML sitemap;
-- existing Medium and legacy-blog URLs remain unchanged.
+External mirrors are automatically excluded from the sitemap. New original
+articles are self-canonical and automatically included.
 
-New original articles omit `canonicalUrl`. They are self-canonical and are
-automatically included in the sitemap. Set `canonicalUrl` only when publishing
-a local reading copy of content whose canonical source is elsewhere.
-
-Article frontmatter is the source of truth for this policy. After building,
-the inventory validator checks every published article's canonical URL,
-sitemap status, structured data, GA4 tag, and local images:
+## Validate the archive
 
 ```sh
 npm run validate:inventory
 ```
 
-Google Analytics 4 is configured once in `src/lib/site.ts` and loaded by the
-shared page layout, so the same measurement ID applies to every generated page.
+Run `npm run build` before publishing. It also checks Astro and runs the archive
+validator.
 
-Social cards are generated as 1200 × 630 PNGs during the Astro build. Home,
-About, Writing, tag archives, and every published article receive a card using
-the shared design in `src/lib/social-card.ts`. Article titles, dates, and tags
-come directly from Markdown frontmatter. Set `socialImage` and `socialImageAlt`
-to build the card from an existing article illustration without displaying it
-again at the top of the article. A `coverImage` is also used for the social card
-when no separate `socialImage` is selected.
+## Configure analytics
+
+Edit the GA4 measurement ID in `src/lib/site.ts`.
+
+## Configure social cards
+
+- Leave `socialImage` unset to generate a title-only 1200 × 630 card.
+- Set `socialImage` and `socialImageAlt` to use an existing article image.
+- Set `coverImage` and `coverImageAlt` when the image should also appear in the
+  article. `coverImage` becomes the social image when `socialImage` is unset.
+- Edit the shared generated-card design in `src/lib/social-card.ts`.
