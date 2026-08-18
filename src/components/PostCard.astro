@@ -1,0 +1,31 @@
+---
+import type { BlogPost } from "../lib/posts";
+import { formatDate, getPostUrl, slugifyTag } from "../lib/posts";
+
+interface Props {
+  post: BlogPost;
+}
+
+const { post } = Astro.props;
+---
+
+<article class="post-card">
+  <div class="post-card__meta">
+    <time datetime={post.data.publishedAt.toISOString()}>
+      {formatDate(post.data.publishedAt)}
+    </time>
+  </div>
+  <div class="post-card__body">
+    <h3><a href={getPostUrl(post)}>{post.data.title}</a></h3>
+    <p>{post.data.description}</p>
+    {
+      post.data.tags.length > 0 && (
+        <ul class="post-card__tags" aria-label="Topics">
+          {post.data.tags.map((tag) => (
+            <li><a href={`/tags/${slugifyTag(tag)}/`}>{tag}</a></li>
+          ))}
+        </ul>
+      )
+    }
+  </div>
+</article>

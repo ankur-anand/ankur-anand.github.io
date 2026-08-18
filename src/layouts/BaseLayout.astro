@@ -1,0 +1,119 @@
+---
+import SiteFooter from "../components/SiteFooter.astro";
+import SiteHeader from "../components/SiteHeader.astro";
+import { SITE } from "../lib/site";
+import "../styles/global.css";
+
+interface Props {
+  title?: string;
+  description?: string;
+  image?: string;
+  imageAlt?: string;
+  imageWidth?: number;
+  imageHeight?: number;
+  type?: "website" | "article" | "profile";
+  publishedAt?: Date;
+  updatedAt?: Date;
+  schema?: Record<string, unknown> | Record<string, unknown>[];
+  noindex?: boolean;
+  canonicalUrl?: string | URL;
+}
+
+const {
+  title = SITE.title,
+  description = SITE.description,
+  image = "/social/home.png",
+  imageAlt,
+  imageWidth,
+  imageHeight,
+  type = "website",
+  publishedAt,
+  updatedAt,
+  schema,
+  noindex = false,
+  canonicalUrl,
+} = Astro.props;
+
+const pageTitle = title === SITE.title ? title : `${title} — ${SITE.name}`;
+const canonical = new URL(canonicalUrl ?? Astro.url.pathname, Astro.site ?? SITE.url);
+const socialImage = new URL(image, Astro.site ?? SITE.url);
+const socialImageAlt = imageAlt ?? `${title} — ${SITE.name}`;
+const personSchema = {
+  "@context": "https://schema.org",
+  "@type": "Person",
+  name: SITE.author,
+  url: SITE.url,
+  sameAs: Object.values(SITE.social),
+  jobTitle: "Software Engineer",
+};
+const jsonLd = schema ?? personSchema;
+const serializedSchema = JSON.stringify(jsonLd).replace(/</g, "\\u003c");
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="generator" content={Astro.generator} />
+    <meta name="theme-color" content="#f7f7f4" />
+    <title>{pageTitle}</title>
+    <meta name="description" content={description} />
+    <meta name="author" content={SITE.author} />
+    {noindex && <meta name="robots" content="noindex, follow" />}
+    <link rel="canonical" href={canonical} />
+    <link rel="sitemap" href="/sitemap-index.xml" />
+    <link
+      rel="alternate"
+      type="application/rss+xml"
+      title={`${SITE.name} RSS feed`}
+      href="/rss.xml"
+    />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+
+    <meta property="og:site_name" content={SITE.name} />
+    <meta property="og:type" content={type} />
+    <meta property="og:title" content={pageTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={socialImage} />
+    <meta property="og:image:alt" content={socialImageAlt} />
+    {imageWidth && <meta property="og:image:width" content={String(imageWidth)} />}
+    {imageHeight && <meta property="og:image:height" content={String(imageHeight)} />}
+    {publishedAt && <meta property="article:published_time" content={publishedAt.toISOString()} />}
+    {updatedAt && <meta property="article:modified_time" content={updatedAt.toISOString()} />}
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:creator" content="@in_aanand" />
+    <meta name="twitter:title" content={pageTitle} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={socialImage} />
+    <meta name="twitter:image:alt" content={socialImageAlt} />
+
+    <script type="application/ld+json" set:html={serializedSchema} is:inline />
+    <script
+      async
+      src={`https://www.googletagmanager.com/gtag/js?id=${SITE.googleAnalyticsId}`}
+      is:inline
+    ></script>
+    <script define:vars={{ googleAnalyticsId: SITE.googleAnalyticsId }} is:inline>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        window.dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", googleAnalyticsId);
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <div class="site-shell">
+      <SiteHeader />
+      <main id="main-content">
+        <slot />
+      </main>
+      <SiteFooter />
+    </div>
+  </body>
+</html>

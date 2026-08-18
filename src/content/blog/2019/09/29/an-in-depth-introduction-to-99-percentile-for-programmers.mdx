@@ -1,0 +1,125 @@
+---
+title: "An Introduction to the 99th Percentile for Programmers"
+description: "Why averages and medians hide tail latency, how the 99th percentile exposes it, and how to calculate and interpret p99 with examples in Go."
+publishedAt: 2019-09-29
+tags: ["Go", "Performance", "Statistics", "Latency"]
+draft: false
+canonicalUrl: "https://medium.com/@ankur_anand/an-in-depth-introduction-to-99-percentile-for-programmers-22e83a00caf"
+originalUrl: "https://medium.com/@ankur_anand/an-in-depth-introduction-to-99-percentile-for-programmers-22e83a00caf"
+legacyUrls: ["https://medium.com/@ankur_anand/an-in-depth-introduction-to-99-percentile-for-programmers-22e83a00caf"]
+---
+
+### With examples in Go (Golang).
+
+Whether you’re just getting started with programming, or you have years of experience, you’ve likely at some point of the time will do or have done some performance test of your application to measure the Latency ([_Latency is defined as_ **_the time it took one operation to happen_**](https://bravenewgeek.com/everything-you-know-about-latency-is-wrong/)).
+
+> When it comes to latency result analysis, **It’s tempting to reach for basic statistics like mean, median or max**. **But this ignores relevance problems** — turning the focus away from latency behavior distribution over time toward others, which often hide the truth.
+
+<figure>
+  <img src="/images/blog/an-in-depth-introduction-to-99-percentile-for-programmers/image-01-6f10ff84.jpg" alt="Actual Vs Mean(Avg), Median, Max report." width="577" height="433" loading="lazy" decoding="async" />
+  <figcaption>Actual Vs Mean(Avg), Median, Max report.</figcaption>
+</figure>
+
+The objective of this blog post is to explain the importance of the analysis of 99 percentile, their notations, differences with basic statistics like mean, median or max, and by the end turn this newly learned knowledge into a real-world scenario and write an Application in Go(Golang) around this.
+
+So let’s focus on understanding these basic elements of statistics, as well and then slowly move toward the other topics as mentioned above.
+
+## **Mean(Average), Median**
+
+Both of these are measures of **central tendency (**which refers to the measure used to determine the “centre” of a distribution of data**).**
+
+> **It’s used to find a single score that is** most representative **of an entire data set**.
+
+Consider this sample data set of latency number in seconds.   
+`[2, 2, 2, 4, 6, 2, 3, 3]`
+
+If we could pick a **single most representative** value to represent this sample data set, what ways we could do it?
+
+**Mean:** Add up all values, then divide by the total number of values.   
+24**/8 = 3**
+
+**Median:** Sort the value in order, and find out what lies in the middle.   
+`[2, 2, 2, 2, 3, 3, 4, 6]` . So here we have `2` and `3` both as the middle element, but we can pick only one, so we take the average of `2` and `3`. **2.5**
+
+Imagine this **single most representative** value **3** or **2.5** given to you from the above latency data set, which you may consider a “normal” Latency number. **But what this single most representative value has done is, it has hidden the outliers** (outlier is a data point that differs significantly from other observations), which may seem insignificant in this small dataset.
+
+These outliers which are usually hidden by the _mean_ and _median,_ are really important because “THIS HAS HAPPENED” within your application and by not having the value of these data you don’t have any insight into what actually happening. **But then, the max is easily distorted by a single outlier**.
+
+> So these single value plotting latency by Mean, Median or Max for Measuring performance is ambiguous and unreliable.
+
+So how do we measure performance more responsibly?. We Look at quantiles, not Mean, Median or Max, which brings us to our next element percentiles.
+
+## Percentiles
+
+Before going to how do Percentiles deal with the above of variables, let us focus on having a basic understanding of percentiles through an example.
+
+Consider the same data set, `[2, 2, 2, 2, 3, 3, 4, 6]` . How many numbers are even? — **6**. What is the percentage of even number? = (6/8)\*100 = **75%.** But that percentage,
+
+> A percentile is a value below which a certain percentage of observation lie. Percentile is NOT Percentage.
+
+So what is the percentile value of `4`in the above dataset? - **(number of value below 4/ total number) \* 100**
+
+(6/8) \*100 = 75 percentile. i.e 75% of data in the dataset is below `4` .
+
+What is the index in the dataset which marks where the percentile just about begin? — (**percentile/100) \* (total number n + 1)**
+
+(50/100) \* (9) = 4.5 ~ 5
+
+The value at Index 5 (not zero indexes) is `3` i.e 50% of the dataset is below 3.
+
+> Plotting latency by percentile distribution is an excellent way to see what your performance behavior actually looks like because latency isn’t going to be uniform, They often exhibit things like GC pauses and other “hiccups,” and central tendency tends to hide these.
+
+**Measuring performance isn’t all that easy, but if you do it, do it responsibly.**
+
+## Using the percentile
+
+Consider you’ve been assigned a task to write a service that makes a call to external service, and you need to Measure the Latency for DNS resolution of a system where the DNS Cache has not been enabled.
+
+### HTTP tracing
+
+Go supports **HTTP tracing** with the help of the `net/http/httptrace` standard package! This package allows you to trace the phases of an HTTP request.
+
+<figure>
+  <img src="/images/blog/an-in-depth-introduction-to-99-percentile-for-programmers/image-02-0a4ff292.jpg" alt="httptrace" width="455" height="184" loading="lazy" decoding="async" />
+  <figcaption>httptrace</figcaption>
+</figure>
+
+The preceding code is all about tracing HTTP requests. The `httptrace.ClientTrace` object defines the events that interest us. When such an event occurs, the relevant code is executed. As we are interested in measuring the DNS latency we will trace when DNS resolution starts and when it ends.
+
+Also since calculating percentiles can be a trivial task in a large dataset. In a naive implementation, we simply store all the values in a sorted array. To find the 75 percentile, you simply find the value that is at `my_array[count(my_array) * 0.75]`.
+
+As the sorted array grows linearly with the number of values in your dataset — clearly, the naive implementation does not scale. So to calculate percentiles across a potentially large dataset of values, _approximate_ percentiles are calculated using **T-Digest: a data structure to estimate quantiles accurately**. It’s an efficient on­line algorithm. To balance the memory utilization with estimation accuracy there is a compression parameter. By increasing the compression value, you can increase the accuracy of your percentiles at the cost of more memory, and it also makes the algorithm slower since the underlying tree data structure grows in size, resulting in more expensive operations.
+
+We will use compression value as `100` for our demonstration purpose.
+
+```
+td := tdigest.NewWithCompression(100)
+```
+
+DNS percentile metrics in Go
+
+Output:
+
+```
+2019/09/30 00:02:34 Avg 0.4358035023000002
+2019/09/30 00:02:34 50th 0.45583694643874645
+2019/09/30 00:02:34 75th 0.5710421958333333
+2019/09/30 00:02:34 90th 0.5991279228758171
+2019/09/30 00:02:34 99th 0.6658698944444444
+```
+
+The example above is not a great one, but it serves its purpose of demonstration.
+
+While the Average latency number `0.43s` from the above output may seem normal, you can see it doesn’t give you the complete truth and is probably _lying to your face_ because with percentile value it can be observed that not even 500 DNS was resolved within that time frame.
+
+With percentile value we can intuitively characterize this system:
+
+1.  Around 900 DNS resolution will happen below `0.59s`
+2.  Around 90 DNS resolution will take between `0.59s` to `0.66s`
+3.  Around 10 DNS resolution will go beyond the `0.66s` .
+
+> It’s Important to understand percentiles to understand latency because you _have_ to consider the entire distribution. Simply looking at the Mean(Avg), Median or even 90th or 99th percentile is not sufficient.
+
+Where to go from here? Gil Tene has a great talk on [“How NOT to Measure Latency](https://youtu.be/lJ8ydIuPFeU)”. **Be aware of the tools that you use for monitoring and benchmarking and the data they report. Many of the tools we use do _not_ do a good job of capturing and representing this data**.
+
+Learned something? Clap your 👏 to help others find this article. Or you can say thank you by [becoming a patreon](https://www.patreon.com/ankuranand)

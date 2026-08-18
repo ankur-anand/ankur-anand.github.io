@@ -1,0 +1,149 @@
+---
+import { render } from "astro:content";
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import {
+  formatDate,
+  getPostUrl,
+  getPublishedPosts,
+  slugifyTag,
+  type BlogPost,
+} from "../../lib/posts";
+import { SITE } from "../../lib/site";
+
+interface Props {
+  post: BlogPost;
+  previous?: BlogPost;
+  next?: BlogPost;
+}
+
+export async function getStaticPaths() {
+  const posts = await getPublishedPosts();
+
+  return posts.map((post, index) => ({
+    params: { slug: post.id },
+    props: {
+      post,
+      previous: posts[index + 1],
+      next: posts[index - 1],
+    },
+  }));
+}
+
+const { post, previous, next } = Astro.props;
+const { Content } = await render(post);
+const socialImagePath = `/social/blog/${post.id}.png`;
+const canonical = new URL(
+  post.data.canonicalUrl ?? getPostUrl(post),
+  Astro.site ?? SITE.url,
+);
+const image = new URL(socialImagePath, Astro.site ?? SITE.url);
+const articleSchema = {
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  headline: post.data.title,
+  description: post.data.description,
+  datePublished: post.data.publishedAt.toISOString(),
+  dateModified: (post.data.updatedAt ?? post.data.publishedAt).toISOString(),
+  image: image.href,
+  mainEntityOfPage: canonical.href,
+  author: {
+    "@type": "Person",
+    name: SITE.author,
+    url: SITE.url,
+  },
+  publisher: {
+    "@type": "Person",
+    name: SITE.author,
+    url: SITE.url,
+  },
+  keywords: post.data.tags.join(", "),
+};
+---
+
+<BaseLayout
+  title={post.data.title}
+  description={post.data.description}
+  image={socialImagePath}
+  imageAlt={post.data.socialImageAlt ?? post.data.coverImageAlt ?? `Social card for ${post.data.title} by Ankur Anand.`}
+  imageWidth={1200}
+  imageHeight={630}
+  type="article"
+  publishedAt={post.data.publishedAt}
+  updatedAt={post.data.updatedAt}
+  schema={articleSchema}
+  canonicalUrl={canonical}
+>
+  <article class="article-shell">
+    <header class="article-header section-pad">
+      <a class="back-link" href="/blog/">← All writing</a>
+      <div class="article-header__meta">
+        <time datetime={post.data.publishedAt.toISOString()}>
+          {formatDate(post.data.publishedAt)}
+        </time>
+        {
+          post.data.updatedAt && (
+            <span>Updated {formatDate(post.data.updatedAt)}</span>
+          )
+        }
+      </div>
+      <h1>{post.data.title}</h1>
+      <p class="article-deck">{post.data.description}</p>
+      {
+        post.data.tags.length > 0 && (
+          <ul class="article-tags" aria-label="Topics">
+            {post.data.tags.map((tag) => (
+              <li><a href={`/tags/${slugifyTag(tag)}/`}>{tag}</a></li>
+            ))}
+          </ul>
+        )
+      }
+      {
+        post.data.coverImage && (
+          <figure class="article-cover">
+            <img
+              src={post.data.coverImage}
+              alt={post.data.coverImageAlt}
+              width="1200"
+              height="675"
+              loading="eager"
+              fetchpriority="high"
+            />
+          </figure>
+        )
+      }
+    </header>
+
+    <div class="article-layout section-pad">
+      <div class="article-prose">
+        <Content />
+      </div>
+    </div>
+
+    {
+      post.data.originalUrl && (
+        <p class="article-origin section-pad">
+          Originally published at <a href={post.data.originalUrl}>{new URL(post.data.originalUrl).hostname}</a>.
+        </p>
+      )
+    }
+  </article>
+
+  {
+    (previous || next) && (
+      <nav class="article-pagination section-pad" aria-label="More articles">
+        {previous ? (
+          <a href={getPostUrl(previous)}>
+            <span>Previous</span>
+            <strong>{previous.data.title}</strong>
+          </a>
+        ) : <span />}
+        {next ? (
+          <a href={getPostUrl(next)} class="article-pagination__next">
+            <span>Next</span>
+            <strong>{next.data.title}</strong>
+          </a>
+        ) : <span />}
+      </nav>
+    )
+  }
+</BaseLayout>

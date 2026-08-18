@@ -1,0 +1,495 @@
+---
+title: "Illustrated Tales of the Go Runtime Scheduler"
+description: "An illustrated tour of Go’s runtime scheduler: operating-system foundations, the G-M-P model, work stealing, preemption, and scheduler traces."
+publishedAt: 2020-03-19
+tags: ["Go", "Runtime", "Concurrency", "Scheduling"]
+draft: false
+socialImage: "/images/blog/illustrated-tales-of-go-runtime-scheduler/image-02-76e00367.png"
+socialImageAlt: "Illustration comparing a lightweight goroutine with an operating-system thread on a seesaw."
+canonicalUrl: "https://medium.com/@ankur_anand/illustrated-tales-of-go-runtime-scheduler-74809ef6d19b"
+originalUrl: "https://medium.com/@ankur_anand/illustrated-tales-of-go-runtime-scheduler-74809ef6d19b"
+legacyUrls: ["https://medium.com/@ankur_anand/illustrated-tales-of-go-runtime-scheduler-74809ef6d19b"]
+---
+
+Concurrency in Go in the form of goroutines is a very convenient means for writing modern concurrent software, but how does your Go program run these goroutines efficiently?  
+In this post, we will peek under the hood to help you understand how the Go runtime scheduler implements this magic by looking into it from the design perspective and how to use it to interpret scheduler trace information from a Go program during performance debugging.
+
+All of the engineering marvels have come out of need, So to understand **why there is a need to have a go runtime scheduler** and **how it works** lets time-travel back to the history of the operating system which will give us insight into problems, as without understanding the root of a problem, there is no hope of solving it. This is what history does.
+
+**History of Operating Systems**
+
+1.  Single user (no OS).
+2.  Batch, uni programmed, run to completion.
+3.  **Multi programmed**
+
+> The purpose of multi-programmed was to overlap CPU and I/O.
+
+How?
+
+**Multiple batches** and **Time Sharing.**
+
+**Multiple batches** —
+
+-   IBM OS/MFT (Multiprogramming with a Fixed number of Tasks)
+-   **IBM OS/MVT (Multiprogramming with a Variable number of Tasks) —** Here each job gets just the amount of memory it needs. That is, the partitioning of memory changes as jobs enter and leave.
+
+**Time-sharing —**
+
+-   This is **multiprogramming with rapid switching between jobs**. Deciding when to switch and which jobs to switch to was called **scheduling**.
+
+Currently, most of the operating system uses time-sharing scheduler.
+
+But then what entity does these scheduler schedule?
+
+1.  Different program in execution (process) or
+2.  **The basic unit of CPU utilization (threads)** that exist as subsets of a process.
+
+But these Entity switches comes at a cost.
+
+### **Scheduling Cost.**
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-01-ea1117f9.png" alt="State variable of process and thread." width="823" height="445" loading="lazy" decoding="async" />
+  <figcaption>State variable of process and thread.</figcaption>
+</figure>
+
+So it’s **more efficient to use one process that contains multiple threads** since process creation is time-consuming and resource-intensive. But then Multithreaded problem, appeared: The C10k Problem being the major one.
+
+For example, if you **define the scheduler period as 10ms (milliseconds)** and you have 2 threads, each thread will get 5ms separately. If you have 5 threads, then each thread gets 2ms. But what happens if there are 1000 threads? Give each thread a time slice of 10 μs (microseconds)? Wrong, it’s stupid to do this, because you will spend a lot of time on context switching, but the real work cannot be done.
+
+You need to limit the length of the time slice. In the last scenario, if the minimum time slice is 2ms and there are 1000 threads, the scheduler cycle needs to be increased to 2s (seconds). If there are 10,000 threads, the scheduler cycle is 20 sec. In this simple example, if each thread uses its full-time slice, it takes 20 sec for all threads to run at once. So we need something that can make our concurrency cheaper, without suffering from too much overhead.
+
+### User Level Threads
+
+-   Threads managed entirely by the run-time system (user-level library).
+-   Ideally, **Fast and efficient: switching threads not much more expensive than a function call**.
+-   The kernel knows nothing about user-level threads and manages them as if they were single-threaded processes.
+
+In Go, we know it by the name of “Goroutine” (logically)
+
+### Goroutine
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-02-76e00367.png" alt="goroutine vs thread" width="489" height="336" loading="lazy" decoding="async" />
+  <figcaption>goroutine vs thread</figcaption>
+</figure>
+
+A _goroutine_ is a **lightweight thread** (logically a thread of execution) managed by the Go runtime. To start a new goroutine running add `go` keyword before the function call `go add(a, b)`
+
+### Simple Goroutine Tour.
+
+```go
+func main() {
+    var wg sync.WaitGroup
+    wg.Add(11)
+    for i := 0; i <= 10; i++ {
+   
+        go func(i int) {
+        defer wg.Done()
+        fmt.Printf("loop i is - %d\n", i)
+        }(i)
+    }
+    wg.Wait()
+    fmt.Println("Hello, Welcome to Go")
+}
+```
+
+[https://play.golang.org/p/9AJkGUSHIxv](https://play.golang.org/p/9AJkGUSHIxv)
+
+Can you guess the output of the above code snippet?.
+
+```
+loop i is - 10
+loop i is - 0
+loop i is - 1
+loop i is - 2
+loop i is - 3
+loop i is - 4
+loop i is - 5
+loop i is - 6
+loop i is - 7
+loop i is - 8
+loop i is - 9
+Hello, Welcome to Go
+```
+
+If we look at the one combination of output, Immediately we have two questions.
+
+1.  **How did 11 goroutines run concurrently?** Magic?
+2.  **In What Order 11 goroutines ran?**
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-03-96a87e79.png" alt="Dr Gopher Strange illustration explaining that goroutine execution order cannot be predicted" width="777" height="412" loading="lazy" decoding="async" />
+</figure>
+
+And these two questions give us a problem
+
+### Problem Outline.
+
+1.  How to distribute these multiple goroutines over multiple OS threads that run on the available CPU processors.
+2.  In what order these multiple goroutines should run to maintain fairness?
+
+The rest of the discussion will mostly around solving these problems specific with Go runtime scheduler from a design perspective. But as with all problems, our domain also needs a well-defined boundary to deal with. Otherwise, the problem statement can be too vague for conclusive discussion. A scheduler may aim at one or more of many goals, for our case we will limit ourselves to the following requirement.
+
+1.  Should be Parallel and Scalable and Fair.
+2.  **Should be Scalable to millions** of goroutine per process (10⁶)
+3.  Memory Efficient. (RAM is cheap, but not free.)
+4.  System calls should not cause performance degradation. (maximizing [_throughput_](https://en.wikipedia.org/wiki/Throughput "Throughput")_,_ minimizing [_wait time_](https://en.wikipedia.org/wiki/Computer_performance#Response_time "Computer performance")_)_
+
+So let’s start modeling our scheduler to solve these problems in incremental steps.
+
+## **1\. Thread Per Goroutine —**
+
+**—** User Level Threading.
+
+Limitations.
+
+1.  Parallel and Scalable.  
+    \* Parallel (yes)  
+    \* Scalable (Not really)
+2.  Is Not Scalable to millions of goroutine per process (10⁶).
+
+## 2\. M:N Threading —
+
+**—** Hybrid Threading
+
+> **M** kernel threads to execute **N** “goroutine”
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-04-a747a40f.png" alt="M kernel threads to execute N “goroutine”" width="656" height="463" loading="lazy" decoding="async" />
+  <figcaption>M kernel threads to execute N “goroutine”</figcaption>
+</figure>
+
+A kernel thread is needed for the actual execution of code and parallelism. But it’s expensive to create, So we map N goroutines to M Kernel Thread. Goroutine is the Go Code, so we have full control over it. Also, it’s in the user-space so it is cheap to create.
+
+But as OS doesn’t know anything about the goroutine. Every goroutine has a state to help **Scheduler knows which goroutine to run based on goroutine state**. This state information is small as compared to the kernel threads, the context switching of goroutine becomes very fast.
+
+-   **Running** — goroutine currently running on kernel thread.
+-   **Runnable** — goroutine waiting for kernel thread to run.
+-   **Blocked** — Goroutines waiting for some conditions (e.g. blocked on a channel, syscall, mutex, etc.)
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-05-f43a8724.png" alt="2 Thread running 2 goroutine at a time." width="1051" height="718" loading="lazy" decoding="async" />
+  <figcaption>2 Thread running 2 goroutine at a time.</figcaption>
+</figure>
+
+So a Go Runtime Scheduler manages these goroutines at various states, by Multiplexing N Goroutine to M Kernel Thread.
+
+### Simple M:N Scheduler
+
+In our simple M:N Scheduler we have a global run queue, Some operation puts a new goroutine into the run queue. M Kernel threads access the scheduler to gets goroutine to run from “run queue”. Multiple threads are attempting to access the same area of memory, **we will lock this structure with Mutex For Memory Access Synchronization**.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-06-2e7b3c6c.png" alt="Simple M:N Scheduler" width="1053" height="629" loading="lazy" decoding="async" />
+  <figcaption>Simple M:N Scheduler</figcaption>
+</figure>
+
+## But where is blocked goroutine?
+
+Some instances when a goroutine can block.
+
+1.  Sending and Receiving on Channel.
+2.  Network I/O.
+3.  Blocking System Call.
+4.  Timers.
+5.  Mutexes.
+
+So where do we put these blocked goroutines? — The design decision where to put these blocked goroutines basically revolves around one fundamental principle-
+
+> Blocked goroutine should not block the underlying kernel thread! (to avoid the **thread context switch cost** )
+
+### Blocked Goroutine during Channel Operation.
+
+Each Channel has a **_recvq (waitq)_** that is _used to store the blocked goroutines which are trying to read data from the channel._
+
+**Sendq (waitq)** stores blocked goroutines _that are trying to send data to the channel. (_ internals of channel:- [https://codeburst.io/diving-deep-into-the-golang-channels-549fd4ed21a8](https://codeburst.io/diving-deep-into-the-golang-channels-549fd4ed21a8)_)_
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-07-9fabca5a.png" alt="Blocked Goroutine during Channel Operation." width="1128" height="629" loading="lazy" decoding="async" />
+  <figcaption>Blocked Goroutine during Channel Operation.</figcaption>
+</figure>
+
+> Unblocked goroutine after channel operation is put into Run queue by the channel itself.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-08-00d9da71.png" alt="Unblocked goroutine after channel operation" width="1128" height="629" loading="lazy" decoding="async" />
+  <figcaption>Unblocked goroutine after channel operation</figcaption>
+</figure>
+
+## What about the system call?
+
+First, let’s look into the **blocking system call**. A system call that blocks the underlying kernel thread, so we cannot Schedule any other Goroutine on this thread.
+
+Implication Blocking System Call reduces the Parallelism level.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-09-cd79394f.png" alt="Blocking System Call reduces the Parallelism level." width="1053" height="629" loading="lazy" decoding="async" />
+  <figcaption>Blocking System Call reduces the Parallelism level.</figcaption>
+</figure>
+
+Cannot Schedule any other Goroutine on M2 thread, resulting in **CPU waste,** as we have work to do but we are not running it.
+
+The way we can restore the parallelism level is while we are entering into system call, we can wake up another thread, which will pick runnable goroutine from the run queue.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-10-aacf14e0.png" alt="Way of restoring parallelism level." width="1129" height="629" loading="lazy" decoding="async" />
+  <figcaption>Way of restoring parallelism level.</figcaption>
+</figure>
+
+**But now we have Oversubscribed Scheduling** when the system call is finished. To avoid we will not run the Goroutine returning from blocking system call instantly. But we will put it into our scheduler run queue.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-11-d56a04d2.png" alt="Avoiding Oversubscribed Scheduling." width="1129" height="629" loading="lazy" decoding="async" />
+  <figcaption>Avoiding Oversubscribed Scheduling.</figcaption>
+</figure>
+
+> So the number of threads greater than number of cores when our program runs. Though not explicitly stated the number of threads is greater than the number of cores and all Idle threads are managed by runtime too, to avoid too many threads.
+
+[https://golang.org/pkg/runtime/debug/#SetMaxThreads](https://golang.org/pkg/runtime/debug/#SetMaxThreads)
+
+**The initial setting is 10,000 threads, the program will crash if it exceeds.**
+
+**Non-Blocking System Call —** Blocks the goroutine on the [**Integrated runtime poller**](https://morsmachine.dk/netpoller), and the thread is released to run another goroutine.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-12-ae905122.png" alt="Diagram of a network file descriptor containing the poll descriptor used by Go's runtime poller" width="431" height="420" loading="lazy" decoding="async" />
+</figure>
+
+For Example in the case of non-blocking I/O such as HTTP calls. The first syscall — that follows the previous workflow — will not succeed since the resource is not yet ready, forcing Go to use the network poller and park the goroutine.
+
+part implementation of `net.Read` function.
+
+```
+n, err := syscall.Read(fd.Sysfd, p)
+        if err != nil {
+            n = 0
+            if err == syscall.EAGAIN && fd.pd.pollable() {
+                if err = fd.pd.waitRead(fd.isFile); err == nil {
+                    continue
+                }
+            }
+```
+
+Once the first syscall is done and explicitly says the resource is not yet ready, **the goroutine will park until the network poller notifies it that the resource is now ready. In this case, thread M will not be blocked**.
+
+Poller will use select / **kqueue / epoll / IOCP** based on the operating system to know which file descriptor is ready and will put the goroutine back on the **run queue** as soon as the file descriptor is ready for reading or writing.
+
+> There is also a Sysmon OS thread that will periodically poll network if it’s not polled for more than 10ms and will add the ready G to the queue.
+
+Basically all of the goroutines blocked for operation on
+
+1.  Channel
+2.  Mutexes
+3.  Network IO
+4.  Timers
+
+Have some **sort of queue**, that helps in scheduling these goroutines.
+
+### Now runtime has a Scheduler with the following functionality.
+
+-   It can handle Parallel Execution (Multiple threads).
+-   Handles Blocking System call and network I/O.
+-   Handles Blocking User level (on channel) calls.
+
+## But it is Not SCALABLE.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-13-2e7b3c6c.png" alt="Global run queue with Mutex" width="1053" height="629" loading="lazy" decoding="async" />
+  <figcaption>Global run queue with Mutex</figcaption>
+</figure>
+
+As you can see we have a Global run queue with Mutex, we will end up with some Issues like
+
+1.  Overhead of cache coherency guarantees.
+2.  Fierce Lock Contention while creating, destroying and scheduling Goroutine G.
+
+Overcoming the Scalability problem with Distributed Scheduler.
+
+## Distributed Scheduler — Run queue Per thread.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-14-6ff0df37.png" alt="Distributed run queue scheduler" width="1168" height="588" loading="lazy" decoding="async" />
+  <figcaption>Distributed run queue scheduler</figcaption>
+</figure>
+
+With this, the immediate benefits we can see is we have now **no mutex** for each thread-local run queue. Still have a global run queue with a mutex, used in special cases. It doesn’t **affect scalability.**
+
+### But now, we have multiple run queues.
+
+1.  Local Run queue
+2.  Global Run queue
+3.  Network Poller
+
+> From where we should run our next goroutine?
+
+**In Go, the poll order has been defined as follows**.
+
+1.  Local Run queue
+2.  Global Run queue
+3.  Network Poller
+4.  Work Stealing
+
+i.e first check local run queue, if empty check global run queue, then check Network Poller and at last do work Stealing. We have some overviews of 1,2,3, by now. Let’s look into the Work Stealing.
+
+## Work Stealing
+
+> If the local work queue is empty, try “stealing work from a different queue”
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-15-349ea145.png" alt="Work Stealing in General." width="1168" height="588" loading="lazy" decoding="async" />
+  <figcaption>Work Stealing in General.</figcaption>
+</figure>
+
+Work stealing solves the problem when one thread has too much work to do and the other is just idle. In Go, work-stealing try to satisfy one the following condition if the local queue is empty.
+
+-   pull work out from the global queue.
+-   pull work from network poller
+-   steal work from the other local queues
+
+### By now Go runtime has a Scheduler with the following functionality.
+
+-   It can handle Parallel Execution (Multiple threads).
+-   Handles Blocking System call and network I/O.
+-   Handles Blocking User level (on channel) calls.
+-   Scalable.
+
+## But it is Not Efficient.
+
+Remember the way we restored the parallelism level in the blocking system call?
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-16-fc3756ae.png" alt="syscall op." width="867" height="422" loading="lazy" decoding="async" />
+  <figcaption>syscall op.</figcaption>
+</figure>
+
+And its implication is we can have multiple kernel thread (Can be 10 or 1000) in a system call, which can be greater the number of cores. We end up with a **Constant overhead during**:
+
+-   **Work stealing**, it has to scan all the kernel thread (ideal and with goroutine running) local run queue both, and most of them will be empty.
+-   **Garbage Collection, Memory allocator** all suffer from the same scan issue. ( [https://blog.learngoprogramming.com/a-visual-guide-to-golang-memory-allocator-from-ground-up-e132258453ed](https://blog.learngoprogramming.com/a-visual-guide-to-golang-memory-allocator-from-ground-up-e132258453ed))
+
+Overcoming the efficiency problem with M:P:N Threading.
+
+## 3\. M:P:N (3 level scheduler) Threading — Introducing Logical Processor P
+
+P — represents the processor, which can be seen as a local scheduler running on a thread;
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-17-6822845b.png" alt="M:P:N Threading" width="1051" height="940" loading="lazy" decoding="async" />
+  <figcaption>M:P:N Threading</figcaption>
+</figure>
+
+> **Logical Process P is always fixed in number. (default to logical CPUs usable by the current process)**
+
+And we put our local run queue (LRQ) inside the fixed number of logical Processors (P).
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-18-5bf02ad3.png" alt="Distributed 3 level run queue scheduler" width="1170" height="533" loading="lazy" decoding="async" />
+  <figcaption>Distributed 3 level run queue scheduler</figcaption>
+</figure>
+
+Go runtime will first create the fixed number of logical processor P based on the number of logical CPUs of the machine (or as requested).
+
+> And each goroutine (G) will run on an OS thread (M) that is assigned to a logical CPU (P).
+
+So Now we have **No Constant overhead during**:
+
+-   **Work stealing** — just have to scan a fixed number of a logical processor (P) local run queue.
+-   **Garbage Collection, Memory allocator** also gain the same benefits.
+
+## What about system call with fixed Logical Processor (P)?
+
+> Go optimizes the system calls — whatever it is blocking or not — by wrapping them up in the runtime.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-19-c34641c2.png" alt="Blocking System Call wrapper." width="604" height="616" loading="lazy" decoding="async" />
+  <figcaption>Blocking System Call wrapper.</figcaption>
+</figure>
+
+The Blocking SYSCALL method is encapsulated between **runtime.entersyscall(SB)  
+runtime.exitsyscall(SB)  
+**In a literal sense, some logic is executed before entering the system call, and some logic is executed after exiting the system call. This wrapper will automatically dissociate the P from the thread M when a blocking system call is made and allow another thread to run on it.
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-20-96917cf8.png" alt="Blocking Syscall Handoffs P." width="1098" height="532" loading="lazy" decoding="async" />
+  <figcaption>Blocking Syscall Handoffs P.</figcaption>
+</figure>
+
+This allows Go runtime to handle the blocking system call efficiently without increasing the run queue.
+
+### What happens Once blocking syscall exits?
+
+-   Runtime tries to acquire the exact same P, and resume the execution.
+-   Runtime tries to acquire a P in the idle list and resume the execution.
+-   Runtime put the goroutine in the global queue and **put the associated M back to the idle list**.
+
+**Spinning Thread and Ideal Thread.**
+
+When M2 thread becomes ideal after syscall returns. What to do with this ideal M2 thread. Theoretically, a thread should be destroyed by the OS if it finishes what it needs to do, and then threads in other processes may be scheduled for execution by the CPU. This is what we often call “preemptive scheduling” of threads in an operating system.
+
+Consider the situation in the syscall above. If we destroy the M2 thread and M3 thread is about to enter into the syscall. At this point, the runnable goroutines cannot be processed until a new Kernel Thread is created and is scheduled to be executed by the OS. Frequent pre-thread preemption operations not only increase the load on the OS but are almost unacceptable for programs with higher performance requirements.
+
+So to properly have the resource utilization of the OS and prevent the frequent thread preemption of the load on the OS, we will not destroy the Kernel Thread M2, instead, it will take a spin operation and save itself for further use. Although it seems that this is a waste of some resources. But when compared with frequent preemption between threads and frequent create and destroy operation “ideal thread” is still very less price we will pay.
+
+**Spinning Thread** — For example, in a Go program with One kernel thread M (1) and One logical processor (P), if the M being executed is being blocked by the syscall, then the same number of “Spinning Threads” as the number of P is required to allow the waiting runnable goroutine to continue executing. Therefore, during this period, the number of kernel threads M is more than the number of P (a Spinning Thread + a blocked thread). So even when `runtime.GOMAXPROCS`value is set to 1, the program will be in a multi-threaded state.
+
+## What about Fairness in Scheduling? — Fairly select the goroutine to be executed next.
+
+> Like many other schedulers, Go too has a fairness constraint and is imposed by the implementation on the goroutines because Runnable goroutine should run eventually
+
+Here are four typical fairness constraints in Go Runtime Scheduler.
+
+Any goroutine running for more than 10ms is marked as preemptible (**soft limit**). But, the preemption is only done at the function prolog. **Go currently uses compiler-inserted cooperative preemption points in function prologues**.
+
+-   **Infinite loop** — preemption (~10ms time slice) — **soft limit**
+
+But be cautious with an infinite loop as Go’s scheduler is not preemptive (till 1.13). If loops don’t contain any preemption points (like function calls, or allocate memory), they will prevent other goroutines from running. A simple example is:
+
+```go
+package main
+func main() {
+    go println("goroutine ran")
+    for {}
+}
+```
+
+If you run with:
+
+```sh
+GOMAXPROCS=1 go run main.go
+```
+
+It may never print the statement until Go(1.13). Due to a lack of preemption points, main Goroutines can hog the processor.
+
+-   **Local Run queue** — preemption (~10ms time slice) — **soft limit**
+-   **Global run queue starvation is avoided** by checking the global run queue for every 61 scheduler tick.
+-   **Network Poller Starvation** Background thread poll network occasionally if not polled by the main worker thread.
+
+Go 1.14 has a new “[non-cooperative preemption](https://github.com/golang/proposal/blob/master/design/24543-non-cooperative-preemption.md)”.
+
+### With that Go, Runtime has a Scheduler with all of the required functionality.
+
+-   It can handle Parallel Execution (Multiple threads).
+-   Handles Blocking System call and network I/O.
+-   Handles Blocking User level (on channel) calls.
+-   Scalable.
+-   Efficient.
+-   Fair.
+
+That offers massive concurrency and always tries to achieve maximum utilization, minimum latencies.
+
+Now that we have a fair bit of idea about Go runtime scheduler in general, how can we use it?. Go provide us with a trace tool, **scheduler trace** especially to provide insights about the behavior and debug the scalability issues related to the goroutine scheduler.
+
+## Scheduler Trace
+
+Run your Go program with the **GODEBUG=schedtrace=DURATION** environment variable to enables the scheduler trace. (DURATION is the period of output in ms.)
+
+<figure>
+  <img src="/images/blog/illustrated-tales-of-go-runtime-scheduler/image-21-6f203427.png" alt="sample schedtrace output with 100ms." width="1529" height="128" loading="lazy" decoding="async" />
+  <figcaption>sample schedtrace output with 100ms.</figcaption>
+</figure>
+
+Go [wiki dedicated to the performance](https://github.com/golang/go/wiki/Performance#scheduler-trace) has more information.
+
+Reference: [**Scalable Go Scheduler Design Doc**](https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw/edit) **and** [**talk**](https://www.youtube.com/watch?v=-K11rY57K7k) by Dmitry Vyukov [https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y\_kqxDv3I3XMw/edit](https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw/edit)
+
+Gopher Artwork credit: Ashley Mcnamara.

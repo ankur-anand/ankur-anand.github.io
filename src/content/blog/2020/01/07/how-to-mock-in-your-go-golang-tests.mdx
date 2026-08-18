@@ -1,0 +1,239 @@
+---
+title: "How to mock? Go Way."
+description: "How to use small interfaces, structs, and hand-written test doubles to isolate dependencies and write focused unit tests with Go's standard library."
+publishedAt: 2020-01-07
+tags: ["Go", "Testing", "Mocking"]
+draft: false
+canonicalUrl: "https://medium.com/@ankur_anand/how-to-mock-in-your-go-golang-tests-b9eee7d7c266"
+originalUrl: "https://medium.com/@ankur_anand/how-to-mock-in-your-go-golang-tests-b9eee7d7c266"
+legacyUrls: ["https://medium.com/@ankur_anand/how-to-mock-in-your-go-golang-tests-b9eee7d7c266"]
+---
+
+<figure>
+  <img src="/images/blog/how-to-mock-in-your-go-golang-tests/image-01-79d4402a.jpg" alt="Diagram of a unit test calling a known component whose unknown dependencies need to be mocked" width="741" height="291" loading="lazy" decoding="async" />
+</figure>
+
+Go has a built-in testing framework provided by the `testing` package, that makes writing tests easier, but how do we write a more complicated test that requires mocking?
+
+In this post, we will learn how to take advantage of structs and interfaces in Go to mock any service or library you might be using, without using any 3rd party tools and libraries.
+
+We will start by defining our system to understand what we are going to test and mock.
+
+### System
+
+<figure>
+  <img src="/images/blog/how-to-mock-in-your-go-golang-tests/image-02-284c5d6a.png" alt="Example System and Integration." width="641" height="271" loading="lazy" decoding="async" />
+  <figcaption>Example System and Integration.</figcaption>
+</figure>
+
+Our system has two components.
+
+1.  **“Our Service”** that we own and build.
+2.  **“Third-party service or library”** that interacts with some database and we use the functionality of it in our service.
+
+> Now Since **we are building “Our Service”** we want to write an independent unit test for “Our Service” but as we use the functionality of third-party service or library in our service if we test without mock’s we will be doing the integration testing which is sometimes complex and more time-consuming.
+
+For our demonstration purpose, we’ll write a simple library that checks if a user exists or not inside a map. Our Service will use this to carry out its business logic and this will become the third-party library inside our system.
+
+### **Third-party Library Code**
+
+### Service
+
+Registers a user. It uses a third party to check for the user’s existence. If the user exists, the service simply returns an error otherwise it carries out the usual business logic.
+
+Code:
+
+If you take a look at the`RegisterUser` function:
+
+```go
+// RegisterUser if the user is not registered before
+func RegisterUser(user User) error { 
+    if userdb.UserExist(user.Email) {  
+        return fmt.Errorf("email '%s' already registered", 
+        user.Email)
+    } 
+    // ...code for registering the user...
+    log.Println(user) 
+    return nil
+}
+```
+
+It calls the function `userdb.UserExist` which is provided by our third-party library and currently we cannot unit test our `RegisterUser` function without doing a third party call.
+
+### Mocks
+
+Let’s try to fix this by mocking.
+
+**About mocking:**
+
+> **_Mock objects meet the_** [**_interface_**](https://en.wikipedia.org/wiki/Interface_%28computer_science%29) **_requirements of, and stand in for, more complex real ones._** _Thank you, Wikipedia!_
+
+Let’s break it up.
+
+1.  **Mock objects meet the interface requirements**.
+
+To do so we have to refactor our service code. _First, we have to define our interface requirement that our mock going to implement_. In our case, we need an interface that is just internal to the package and provides a way to test if a user exists or not.
+
+```
+// registrationPreChecker validates if user is allowed to register.
+type registrationPreChecker interface {
+    userExists(string) bool
+}
+```
+
+**Interface Implementation**.   
+`userExists` function of our new defined interface simply wraps the call to the actual call to third party service.
+
+```
+type regPreCheck struct {}
+func (r regPreCheck) userExists(email string) bool {
+    return userdb.UserExist(email)
+}
+```
+
+Next, we will create a package-level variable of type `registrationPreChecker` and assign an instance of `regPreCheck` to it within `init` function.
+
+```go
+var regPreCond registrationPreChecker
+
+func init() {
+   regPreCond = regPreCheck{}
+}
+```
+
+As `regPreCond` is of type `registrationPreChecker` which validates the user exists or not, we can use this inside our `RegisterUser` function. So instead of directly calling `userdb.UserExist` function inside `RegisterUser` function we will call it through our interface implementation.
+
+```
+// check if user is already registered
+found := regPreCond.userExist(user.Email)
+```
+
+Refactored code:
+
+If we run the `go test` again it passes because we haven’t changed any behavior of our function. But let's see how this makes unit testing of our service so easy—through mocks.
+
+### Writing mocks
+
+Let’s see the complete code of our test first.
+
+> **Mock objects meet the interface requirements**.
+
+Here our’s mock object implements the `registrationPreChecker` interface.
+
+```
+type preCheckMock struct{}
+
+func (u preCheckMock) userExists(email string) bool {
+   return userExistsMock(email)
+}
+```
+
+Mock implementation is returning an `userExistsMock` function type here instead of directly returning `true` or `false.` _This helps in assigning mock at runtime instead of compile-time._ You can see this in the TestRegisterUser function.
+
+2\. **_and stand in for, more complex real ones_**
+
+```
+regPreCond = preCheckMock{}
+```
+
+We simply assigned our `regPreCond` of type `registrationPreChecker` which validates the user exists or not with our mock implementation during runtime of our test. As you can see in `TestRegisterUser` function.
+
+```go
+func TestRegisterUser(t *testing.T) {
+   user := User{
+      Name:     "Ankur Anand",
+      Email:    "anand@example.com",
+      UserName: "anand",
+   }
+
+   regPreCond = preCheckMock{}
+   userExistsMock = func(email string) bool {
+      return false
+   }
+
+   err := RegisterUser(user)
+   if err != nil {
+      t.Fatal(err)
+   }
+
+   userExistsMock = func(email string) bool {
+      return true
+   }
+   err = RegisterUser(user)
+   if err == nil {
+      t.Error("Expected Register User to throw and error got nil")
+   }
+}
+```
+
+### **But we are done yet!**
+
+We said Go way, right but right now there is an issue, with the way we have refactored it.
+
+> We have used the Global variable and event though we are not updating the variable during the actual run, this is going to break the parallel test.
+
+There are different ways we can fix this, In our case, we are going to pass this \`registrationPreChecker\` as a dependency to our function and will introduce a New Constructor function that will create a default \`registrationPreChecker\` type that can be used during actual usage, and since we are also passing this as a dependency, we can pass our mock implementation as a parameter during this.
+
+```go
+func NewRegistrationPreChecker() RegistrationPreChecker {
+   return regPreCheck{}
+}
+
+// RegisterUser will register a User if only User has not been previously
+// registered.
+func RegisterUser(user User, regPreCond RegistrationPreChecker) error {
+   // check if user is already registered
+   found := regPreCond.userExists(user.Email)
+   if found {
+      return fmt.Errorf("email '%s' already registered", user.Email)
+   }
+   // carry business logic and Register the user in the system
+   log.Println(user)
+   return nil
+}
+```
+
+Let’s modify our test code too. So instead of modifying the package level variable, we are now explicitly passing it as a dependency inside our \`RegisterUser\` function.
+
+```go
+func TestRegisterUser(t *testing.T) {
+   user := User{
+      Name:     "Ankur Anand",
+      Email:    "anand@example.com",
+      UserName: "anand",
+   }
+
+   regPreCond := preCheckMock{}
+   userExistsMock = func(email string) bool {
+      return false
+   }
+
+   err := RegisterUser(user, regPreCond)
+   if err != nil {
+      t.Fatal(err)
+   }
+
+   userExistsMock = func(email string) bool {
+      return true
+   }
+   err = RegisterUser(user, regPreCond)
+   if err == nil {
+      t.Error("Expected Register User to throw and error got nil")
+   }
+}
+```
+
+Source Code:
+
+[**ankur-anand/go-test-demo**  
+_You can't perform that action at this time. You signed in with another tab or window. You signed out in another tab or…_github.com](https://github.com/ankur-anand/go-test-demo "https://github.com/ankur-anand/go-test-demo")[](https://github.com/ankur-anand/go-test-demo)
+
+## Conclusion
+
+Well, while this is not the only way to write a mock in Go, but with this hopefully you now have the general idea of mocking and how to take advantage of structs and interfaces in Go to mock any artifacts you might be using, without any external mocking library.
+
+Alright, that’s all for now. Thank you for reading so far.
+
+## Let’s stay in touch:
+
+-   ❤️ Do you want to help? Please clap and share the article. Let other people also learn from this article.

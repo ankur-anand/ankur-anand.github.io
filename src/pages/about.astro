@@ -1,0 +1,119 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { SITE } from "../lib/site";
+
+const description =
+  "About Ankur Anand, a staff software engineer and writer based in Bengaluru, India.";
+const aboutSchema = {
+  "@context": "https://schema.org",
+  "@type": "ProfilePage",
+  "@id": `${SITE.url}/about/#profile`,
+  url: `${SITE.url}/about/`,
+  name: "About Ankur Anand",
+  description,
+  mainEntity: {
+    "@type": "Person",
+    "@id": `${SITE.url}/#person`,
+    name: SITE.author,
+    url: SITE.url,
+    jobTitle: "Staff Software Engineer",
+    sameAs: Object.values(SITE.social),
+  },
+};
+
+const experience = [
+  { period: "2024–present", role: "Staff Software Engineer", company: "Walmart Global Tech" },
+  { period: "2022–2024", role: "Senior Software Engineer", company: "Walmart Global Tech" },
+  { period: "2020–2022", role: "Software Engineer", company: "Walmart Global Tech" },
+  { period: "2018–2020", role: "Developer", company: "SAP" },
+  { period: "2018", role: "Senior Technology Consultant", company: "Incture Technologies" },
+  { period: "2014–2018", role: "System Engineer", company: "Tata Consultancy Services" },
+];
+---
+
+<BaseLayout
+  title="About"
+  description={description}
+  type="profile"
+  schema={aboutSchema}
+  image="/social/about.png"
+  imageAlt="About Ankur Anand, staff software engineer and writer."
+  imageWidth={1200}
+  imageHeight={630}
+>
+  <header class="page-intro page-intro--about">
+    <h1>About</h1>
+    <p>
+      I’m Ankur, a Staff Software Engineer at Walmart Global Tech. I build
+      distributed systems and platform infrastructure, mostly in Go.
+    </p>
+  </header>
+
+  <div class="about-grid">
+    <section aria-labelledby="work-writing-heading">
+      <h2 id="work-writing-heading">Work and writing</h2>
+      <div class="prose-copy">
+        <p>
+          I have been building production software since 2014. Over the years,
+          I’ve worked on multi-region health checking, configuration distribution,
+          API gateways, load balancers, reverse proxies, search, and cloud-native
+          infrastructure.
+        </p>
+        <p>
+          I enjoy problems where reliability, performance, and failure handling
+          matter. When I run into something I do not understand, I usually end up
+          reading the source, finding the relevant papers, running a few experiments,
+          and writing down what I learned.
+        </p>
+        <p>
+          I also contribute to open-source projects, including Envoy Proxy,
+          Apache Iceberg, Pebble, and L3AF.
+        </p>
+        <p>
+          Outside software, I make photographs and occasionally write poetry.
+        </p>
+      </div>
+    </section>
+
+    <aside class="contact-card">
+      <h2>Contact</h2>
+      <p>{SITE.location}</p>
+      <p>{SITE.email}</p>
+      <ul>
+        <li><a href={SITE.social.linkedin}>LinkedIn</a></li>
+        <li><a href={SITE.social.github}>GitHub</a></li>
+        <li><a href={SITE.social.twitter}>X / Twitter</a></li>
+        <li><a href={SITE.social.stackOverflow}>Stack Overflow</a></li>
+      </ul>
+    </aside>
+  </div>
+
+  <section class="timeline-section" aria-labelledby="experience-heading">
+    <div class="section-heading">
+      <h2 id="experience-heading">Experience</h2>
+      <a class="text-link" href={SITE.social.linkedin}>Full details on LinkedIn</a>
+    </div>
+    <ol class="timeline">
+      {
+        experience.map((item) => (
+          <li>
+            <span class="timeline__year">{item.period}</span>
+            <div>
+              <h3>{item.role}</h3>
+              <p>{item.company}</p>
+            </div>
+          </li>
+        ))
+      }
+    </ol>
+  </section>
+
+  <section class="education">
+    <h2>Education</h2>
+    <div>
+      <span class="timeline__year">2014</span>
+      <h3>Bachelor of Technology</h3>
+      <p>Electronics and Telecommunication Engineering · KIIT University</p>
+    </div>
+  </section>
+</BaseLayout>

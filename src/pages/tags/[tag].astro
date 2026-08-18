@@ -1,0 +1,51 @@
+---
+import PostCard from "../../components/PostCard.astro";
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import { getPublishedPosts, slugifyTag, type BlogPost } from "../../lib/posts";
+
+interface Props {
+  tag: string;
+  posts: BlogPost[];
+}
+
+export async function getStaticPaths() {
+  const posts = await getPublishedPosts();
+  const tags = new Map<string, string>();
+
+  for (const post of posts) {
+    for (const tag of post.data.tags) {
+      tags.set(slugifyTag(tag), tag);
+    }
+  }
+
+  return [...tags].map(([slug, tag]) => ({
+    params: { tag: slug },
+    props: {
+      tag,
+      posts: posts.filter((post) => post.data.tags.includes(tag)),
+    },
+  }));
+}
+
+const { tag, posts } = Astro.props;
+---
+
+<BaseLayout
+  title={`${tag} articles`}
+  description={`Writing by Ankur Anand about ${tag}.`}
+  image={`/social/tags/${slugifyTag(tag)}.png`}
+  imageAlt={`${tag} articles by Ankur Anand.`}
+  imageWidth={1200}
+  imageHeight={630}
+>
+  <header class="page-intro page-intro--compact section-pad">
+    <a class="back-link" href="/blog/">← All writing</a>
+    <h1>{tag}</h1>
+    <p>{posts.length} {posts.length === 1 ? "article" : "articles"}</p>
+  </header>
+  <section class="archive section-pad" aria-label={`${tag} article archive`}>
+    <div class="archive-list">
+      {posts.map((post) => <PostCard post={post} />)}
+    </div>
+  </section>
+</BaseLayout>

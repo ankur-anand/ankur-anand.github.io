@@ -1,0 +1,92 @@
+---
+import PostCard from "../../components/PostCard.astro";
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import { getPublishedPosts, slugifyTag } from "../../lib/posts";
+import { SITE } from "../../lib/site";
+
+const posts = await getPublishedPosts();
+const description =
+  "Essays and visual guides by Ankur Anand about Go, distributed systems, databases, performance, and software engineering.";
+const blogSchema = {
+  "@context": "https://schema.org",
+  "@type": "Blog",
+  "@id": `${SITE.url}/blog/#blog`,
+  url: `${SITE.url}/blog/`,
+  name: "Writing by Ankur Anand",
+  description,
+  inLanguage: "en",
+  author: {
+    "@type": "Person",
+    "@id": `${SITE.url}/#person`,
+    name: SITE.author,
+    url: SITE.url,
+    sameAs: Object.values(SITE.social),
+  },
+  isPartOf: {
+    "@type": "WebSite",
+    "@id": `${SITE.url}/#website`,
+    name: SITE.name,
+    url: SITE.url,
+  },
+};
+const tags = [...new Set(posts.flatMap((post) => post.data.tags))].sort((a, b) =>
+  a.localeCompare(b),
+);
+const postsByYear = posts.reduce<Map<number, typeof posts>>((years, post) => {
+  const year = post.data.publishedAt.getUTCFullYear();
+  years.set(year, [...(years.get(year) ?? []), post]);
+  return years;
+}, new Map());
+---
+
+<BaseLayout
+  title="Writing on Go, Databases & Distributed Systems"
+  description={description}
+  schema={blogSchema}
+  image="/social/writing.png"
+  imageAlt="Writing by Ankur Anand about Go, databases, and distributed systems."
+  imageWidth={1200}
+  imageHeight={630}
+>
+  <header class="page-intro">
+    <h1>Writing</h1>
+    <p>
+      Notes and visual explanations about Go, distributed systems, databases,
+      performance, and software engineering.
+    </p>
+  </header>
+
+  {
+    tags.length > 0 && (
+      <details class="tag-nav">
+        <summary>Browse by topic</summary>
+        <nav aria-label="Browse writing by topic">
+          {tags.map((tag) => (
+            <a href={`/tags/${slugifyTag(tag)}/`}>{tag}</a>
+          ))}
+        </nav>
+      </details>
+    )
+  }
+
+  <section class="archive" aria-label="Article archive">
+    {
+      posts.length > 0 ? (
+        [...postsByYear].map(([year, yearPosts]) => (
+          <section class="year-group" aria-labelledby={`year-${year}`}>
+            <h2 id={`year-${year}`}>{year}</h2>
+            <div class="archive-list">
+              {yearPosts.map((post) => <PostCard post={post} />)}
+            </div>
+          </section>
+        ))
+      ) : (
+        <p class="archive-note">
+          I’m moving the archive here. For now, read it on
+          <a href="https://blog.ankuranand.com"> the previous blog</a> or
+          <a href={SITE.social.medium}> Medium</a>.
+        </p>
+      )
+    }
+  </section>
+</BaseLayout>

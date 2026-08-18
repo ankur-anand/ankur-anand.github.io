@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title description">
+  <title id="title">Ankur Anand</title>
+  <desc id="description">Software engineer and writer</desc>
+  <rect width="1200" height="630" fill="#f7f7f4"/>
+  <line x1="80" y1="105" x2="1120" y2="105" stroke="#d9d9d3" stroke-width="2"/>
+  <text x="80" y="78" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="21" fill="#686864">ankuranand.com</text>
+  <text x="80" y="300" font-family="Inter, system-ui, sans-serif" font-size="88" font-weight="700" letter-spacing="-3" fill="#20201e">Ankur Anand</text>
+  <text x="84" y="365" font-family="Inter, system-ui, sans-serif" font-size="32" fill="#686864">software engineer and writer</text>
+  <text x="84" y="510" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="21" fill="#1456a0">Go  ·  distributed systems  ·  databases  ·  performance</text>
+</svg>

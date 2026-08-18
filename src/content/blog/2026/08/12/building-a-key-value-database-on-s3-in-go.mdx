@@ -1,0 +1,622 @@
+---
+title: "Building a Key-Value Database on S3 in Go"
+description: "How an LSM tree gives us the right building blocks, and where object storage changes the design."
+publishedAt: 2026-08-12
+tags: ["Go", "Databases", "Object storage", "LSM trees"]
+draft: false
+socialImage: "/images/blog/building-a-key-value-database-on-s3-in-go/image-01-573c4a05.png"
+socialImageAlt: "Illustration of writes becoming immutable sorted objects in object storage."
+canonicalUrl: "https://medium.com/@ankur_anand/building-a-key-value-database-on-s3-in-go-fb08d040f0af"
+originalUrl: "https://medium.com/@ankur_anand/building-a-key-value-database-on-s3-in-go-fb08d040f0af"
+legacyUrls: ["https://medium.com/@ankur_anand/building-a-key-value-database-on-s3-in-go-fb08d040f0af"]
+---
+
+## How an LSM tree gives us the right building blocks, and where object storage changes the design
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-01-573c4a05.png" alt="view of writes becoming immutable sorted objects in remote object storage" width="1672" height="941" loading="lazy" decoding="async" />
+  <figcaption>view of writes becoming immutable sorted objects in remote object storage</figcaption>
+</figure>
+
+_The database lives in object storage. Local disk is only a cache._
+
+What happens when S3 is the primary storage layer of a database?
+
+Not a backup target. Not an archive where we move cold files. The database has to recover, read, write, compact, and garbage-collect while its durable state lives in object storage.
+
+When I first started thinking about this, the storage part looked deceptively simple.
+
+A database writes files. S3 stores objects. Upload the file instead of writing it to disk, download it when a reader needs it, and we should have a database on object storage.
+
+Unfortunately, this is where the abstraction starts leaking.
+
+A database does not depend on a filesystem only for storing bytes. It quietly depends on atomic rename, cheap random reads, directory traversal, file locking, predictable errors, and a reasonably clear answer to one basic question:
+
+> _Did my write happen?_
+
+Once S3 becomes the primary storage layer, each of these assumptions changes. Some disappear completely. Others return in a different form, usually as a metadata or distributed systems problem.
+
+The good news is that we do not have to start from nothing. A log-structured merge tree, or LSM tree, already has most of the data model that object storage wants. It accumulates writes in memory, turns them into immutable sorted-string tables, and replaces old tables by writing new tables during compaction.
+
+SSTs fit object storage well because neither side requires in-place updates.
+
+But the SST is only one part of a database engine. We still need to decide when an uploaded SST becomes visible, how readers find it, what happens when two processes race, how old objects are deleted, and how the database recovers when any process disappears in the middle of these steps.
+
+This article is about those parts. It follows the design of [IsleDB](https://github.com/ankur-anand/isledb), a key-value database written in Go with object storage as its durability and capacity layer.
+
+## What does a local database get from its filesystem?
+
+Before removing the local disk, it helps to understand what it was doing for us.
+
+Consider a simplified database commit:
+
+```lua
+write new data file
+fsync data file
+write new manifest
+fsync manifest
+rename manifest.tmp -> manifest
+fsync directory
+```
+
+There are many possible designs, but local storage engines commonly build their commit protocol from operations like these:
+
+1.  Create a file.
+2.  Append or overwrite bytes.
+3.  Flush bytes to durable storage.
+4.  Atomically rename one path over another.
+5.  Open many small files cheaply.
+6.  List a directory to discover files.
+7.  Delete a file when no reader can still need it.
+
+S3 has keys and objects, not files and directories. A slash inside an object key is a naming convention. It is not a directory transaction boundary. There is no rename operation. Moving an object means copying it to a new key and deleting the old key, which is already two independently visible operations.
+
+S3 now provides strong consistency for object PUT and DELETE operations. A successful change is immediately reflected in subsequent GET and LIST requests. That is important, and it means we should not repeat the old claim that a newly written object may remain invisible to LIST for an arbitrary period. But strong consistency for individual keys does not give us an atomic transaction over five SSTs, a manifest page, and a database head. [An update to one S3 key is atomic](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel). A database commit usually spans more than one object.
+
+So the problem is not simply eventual consistency.
+
+The problem is that object storage gives us atomicity at a different boundary than a database needs.
+
+## An LSM tree already speaks the language of object storage
+
+A B-tree is designed around page updates. A node is read, changed, split, and written back. That model can be made to work over remote storage, but frequent small in-place changes are exactly what object storage is not built to serve.
+
+An LSM tree takes a different path.
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-02-3f76fc78.png" alt="LSM building blocks map naturally to object storage" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>LSM building blocks map naturally to object storage</figcaption>
+</figure>
+
+_Small random mutations become large immutable objects._
+
+The basic properties line up surprisingly well:
+
+-   A **memtable** collects small writes before we pay for remote I/O.
+-   An **SST** is a large immutable object written sequentially.
+-   A **tombstone** represents deletion without modifying an older object.
+-   A **manifest** describes exactly which immutable SSTs are live.
+-   **Compaction** replaces old objects by creating new immutable objects.
+-   **Bloom filters and block indexes** help us avoid fetching most remote bytes.
+
+A write does not modify an old SST. It creates a new version of a key in a new SST. A delete is represented by a tombstone. Compaction later merges sorted runs and removes versions that are no longer needed.
+
+This is already close to the object-storage model.
+
+> _The LSM gives us immutable data files. It does not give us an object-store commit protocol._
+
+That remaining distinction shapes the rest of the engine.
+
+## First attempt: upload the SST and list the bucket
+
+Let’s start with the smallest possible design.
+
+When a memtable fills, encode it as an SST and upload it below an `sstable/` prefix.
+
+```typescript
+accounts/
+  sstable/
+    001.sst
+    002.sst
+    003.sst
+```
+
+A reader can list this prefix, open every SST, and merge them.
+
+Simple enough. But when does `003.sst` become part of the database?
+
+Suppose one logical commit requires several objects and the writer uploads only some of them. Or it uploads the SST but crashes before recording its sequence range. Or compaction uploads replacement files but crashes before publishing the replacement topology. Even with strongly consistent listing, the list only tells us which keys exist. It does not tell us which set of keys forms one committed database state.
+
+Listing also becomes more expensive as the database grows, and reconstructing ordering from object names turns naming into part of the transaction protocol.
+
+We need something that explicitly describes the visible state.
+
+## Introducing the manifest
+
+An LSM manifest records the logical arrangement of SSTs.
+
+At a high level, it answers:
+
+```text
+Which L0 SSTs are visible?
+Which SSTs belong to L1, L2, ...?
+What sequence numbers have been committed?
+Which SSTs were removed by compaction?
+```
+
+Now the reader does not list `sstable/` to discover database contents. It loads the manifest and reads only the objects referenced by it.
+
+This gives us the first important rule:
+
+> _An object existing in S3 does not make it part of the database._
+
+Object existence and database visibility are different states.
+
+That difference is useful. If a writer crashes after uploading `c.sst` but before publishing it, the object is leaked, but the database is still correct. An orphaned object can be reclaimed later. Publishing a half-formed state cannot be repaired so easily.
+
+But now we have another question.
+
+How do we update the manifest atomically?
+
+## `CURRENT` is the visibility authority
+
+In IsleDB, one small object called `manifest/CURRENT` is the authoritative database head.
+
+The simplified object layout looks like this:
+
+```xml
+<database-prefix>/
+  manifest/
+    CURRENT
+    snapshots/
+      <id>.manifest.zst
+    pages/
+      l00/<id>.page.zst
+      l01/<id>.page.zst
+    gc/
+      sst/ready/<plan-id>.json
+      change-feed/ready/<plan-id>.json
+  maintenance/
+    HEAD
+  sstable/
+    <shard>/<sst-id>
+  changes/
+    <shard>/<change-batch-id>
+```
+
+`CURRENT` contains the active tail of the manifest, references to older immutable manifest pages and snapshots, fencing state, sequence counters, change-feed configuration, and bounded receipts used for idempotency.
+
+The large objects are immutable. `CURRENT` is the small mutable root that decides which immutable graph is visible.
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-03-7df4d6d1.png" alt="visible objects" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>visible objects</figcaption>
+</figure>
+
+_The bucket can contain more objects than the database can see._
+
+A reader begins at `CURRENT` and follows its references. It never starts with a bucket listing and tries to guess which objects are live.
+
+> _Visibility is decided by_ `_CURRENT_`_, not by listing the bucket._
+
+## Publishing one write
+
+Now we can follow a write through the engine.
+
+`Put` and `Delete` first add mutations to an in-memory memtable. They are not durable yet. A flush rotates the memtable and publishes it as one logical commit.
+
+The publication order is:
+
+```markdown
+1. Build and upload the SST
+2. Build and upload the change batch, if enabled
+3. Build the next manifest state
+4. Conditionally update manifest/CURRENT
+5. Acknowledge the flush
+```
+
+The critical order is data first, reference last.
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-04-a5c46e12.png" alt="commit protocol uploads data before conditionally publishing CURRENT" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>commit protocol uploads data before conditionally publishing CURRENT</figcaption>
+</figure>
+
+_A flush has one visibility boundary._
+
+If the process dies before step 4, readers keep using the previous `CURRENT`. The uploaded SST may be orphaned, but it is not visible.
+
+If step 4 succeeds, every object referenced by the new database head has already completed its upload.
+
+If `Flush` returns successfully, the commit is both durable and discoverable by a newly opened or refreshed reader.
+
+> _Upload data first. Publish references to it last._
+
+This simple ordering is the closest thing we have to an object-store transaction.
+
+## Building an SST while uploading it
+
+SSTs can be large, so buffering the entire encoded file in memory before uploading it would make flush memory proportional to output size.
+
+Go gives us a useful building block here: `io.Pipe`.
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-05-8b84d061.png" alt="streams encoded SST bytes through io.Pipe into an object-store" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>streams encoded SST bytes through io.Pipe into an object-store</figcaption>
+</figure>
+
+The producer goroutine reads sorted memtable entries and writes encoded SST bytes into the pipe. The consumer goroutine reads those bytes and sends them to the object store. Backpressure is automatic. If the network upload slows down, the encoder eventually blocks on the pipe instead of allocating an unbounded buffer.
+
+The rough shape is:
+
+```go
+reader, writer := io.Pipe()
+
+group.Go(func() error {
+    return upload(ctx, objectKey, reader)
+})
+
+group.Go(func() error {
+    defer writer.Close()
+    return buildSST(writer, memtable)
+})
+
+err := group.Wait()
+```
+
+The real code needs more care than this small example. `io.Pipe` does not understand `context.Context` by itself. If the uploader fails but the read side remains open, the producer may wait forever while writing. If the producer fails but the write side remains open, the uploader may wait forever for EOF.
+
+Every exit path must close the corresponding pipe endpoint, and errors must travel to the other side.
+
+That failure mode is severe because the flush path is serialized. A producer blocked on the pipe can hold the flush lock and stop every later flush.
+
+> _Cancellation is useful only when every blocking primitive in the path can observe it._
+
+## But what if two writers update `CURRENT`?
+
+We now have a small mutable head, so concurrent publication becomes the next problem.
+
+An unconditional PUT is not enough:
+
+```sql
+Writer A reads CURRENT generation 10
+Writer B reads CURRENT generation 10
+
+Writer A writes generation 11 containing SST A
+Writer B writes generation 11 containing SST B
+
+Last response wins, one commit disappears
+```
+
+Instead, `CURRENT` is updated with a conditional write. The writer reads both the object and its provider version, builds the next state, and replaces it only if the version still matches.
+
+On S3 this is built from `If-Match` and `If-None-Match`. S3 compares the supplied ETag with the current object and rejects the write if the precondition no longer holds. [AWS documents both the](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) `[412 Precondition Failed](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)` [result and possible](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) `[409 Conflict](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)` [responses during concurrent conditional operations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html).
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-06-9e83ce00.png" alt="conditional CURRENT update" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>conditional CURRENT update</figcaption>
+</figure>
+
+Error classification now becomes part of the database protocol. A provider conflict means another operation won the race. It is not necessarily a damaged bucket or permanent upload failure.
+
+For this conditional publication path, a `409 ConditionalRequestConflict` belongs to the retryable precondition-conflict class. If a driver maps it to an unrelated fatal error, a correct CAS loop on paper becomes a failing commit protocol in production.
+
+## One active writer and a fence
+
+Retrying CAS solves lost updates, but IsleDB intentionally allows only one active writer for a database prefix.
+
+Why keep a writer fence if `CURRENT` already uses CAS?
+
+CAS prevents two updates from replacing the same version. It does not express ownership over a sequence of commits. An old writer can pause, lose its role, resume later, read the latest `CURRENT`, and attempt another otherwise valid update.
+
+A fence token closes that hole.
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-07-877ba272.png" alt="CAS checks the generation while the persisted fence checks the writer epoch" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>CAS checks the generation while the persisted fence checks the writer epoch</figcaption>
+</figure>
+
+_The old writer can read the latest state and still be forbidden from publishing it._
+
+The fence is persisted in `CURRENT`. Every writer publication verifies that its local token still matches the authoritative token. Claiming a new writer advances the epoch, so work from an older owner cannot be published after replacement.
+
+There is a separate fence for maintenance ownership because maintenance also spans multiple operations and can outlive one process.
+
+> _CAS protects one update. A fence protects ownership across updates._
+
+## The uncomfortable case: the write succeeded, but the response was lost
+
+Remote APIs introduce an awkward state that local code often tries to flatten into an ordinary error.
+
+Suppose the conditional PUT of `CURRENT` reaches S3 and succeeds, but the connection disappears before the writer receives the response.
+
+Did the commit happen?
+
+The writer cannot answer from the error alone.
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-08-5f0d5556.png" alt="lost response" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>lost response</figcaption>
+</figure>
+
+_The client sees an error even though the new database state is already visible._
+
+Blindly retrying with a new manifest entry can publish the same memtable twice. Treating the error as a definite failure can report an error for a commit that is already visible.
+
+IsleDB gives each pending flush a stable commit ID. `CURRENT` retains a bounded marker for the latest writer commit: the commit ID, a fingerprint of the uploaded objects, and the manifest position. The pending flush keeps its uploaded-object metadata across publication retries.
+
+After an uncertain result, retry logic reads `CURRENT` again:
+
+1.  If the same commit ID and fingerprint are present, the earlier write succeeded.
+2.  If the commit ID exists with different metadata, there is an identity conflict.
+3.  If the commit is absent and the fence is still valid, publication may be retried.
+4.  If the writer has been fenced, the old process must stop.
+
+> _A timeout does not mean that a write failed. It means the outcome is unknown until reconciled._
+
+Idempotency here is not a convenience. It is what makes the publication boundary usable over a retry-heavy remote API.
+
+## Keeping `CURRENT` bounded
+
+If every commit were appended forever inside `CURRENT`, the authoritative object would eventually become another large database file. Every small write would require reading and replacing an ever-growing JSON object.
+
+So the manifest is split into layers:
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-09-f78d1ed0.png" alt="manifest layer" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>manifest layer</figcaption>
+</figure>
+
+_The mutable root stays small while immutable metadata carries the history._
+
+Recent entries stay directly in `CURRENT`. When the active tail grows past its bounds, entries move into immutable compressed pages. Higher-level pages reference lower-level pages. Periodic snapshots bound how much history must be replayed when the database opens.
+
+This repeats the same pattern as the data path:
+
+1.  Write a new immutable metadata object.
+2.  Verify its size and checksum.
+3.  Publish its reference through a conditional `CURRENT` update.
+
+Manifest pages and snapshots carry their encoded size and SHA-256 checksum in the reference. Their decoders also know the maximum allowed uncompressed size before decompression begins. Metadata is small compared with SST data, but corrupt metadata can be much more destructive because it decides what the entire database means.
+
+## How does a reader find one key?
+
+A reader first loads a consistent manifest view. That view contains overlapping L0 SSTs and non-overlapping, key-sorted SSTs in the lower levels.
+
+For a point lookup, the reader can use:
+
+1.  Key bounds in SST metadata.
+2.  Bloom filters to reject files that cannot contain the key.
+3.  Level ordering to binary-search non-overlapping levels.
+4.  Sequence numbers and tombstones to select the newest visible result.
+
+The reader does not need to download every SST. Depending on configuration and file size, it can either cache the complete SST locally or use bounded range requests with a block cache.
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-10-3fa5c933.png" alt="reader cache" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>reader cache</figcaption>
+</figure>
+
+_Most SSTs are rejected before their data blocks are fetched._
+
+The same immutable layout allows many reader processes to open the same bucket and prefix. They do not need a full durable copy of the database on local disk. Their local state is a cache plus a pinned view of the remote manifest.
+
+## The local cache is useful, but it is not the database
+
+Network reads are much more expensive than memory mapping a local file. A disk cache turns repeated SST access back into local I/O and allows the SST reader to work over memory-mapped bytes.
+
+But a cache introduces another copy of the data, and that copy can be incomplete.
+
+Imagine the process starts downloading a 64 MiB SST and the connection closes after 31 MiB. If that partial file were promoted into the cache, the first read would fail. If every later read reused the same file, one transient download would poison that SST for the lifetime of the process.
+
+To prevent that, the cache path follows a strict sequence:
+
+```perl
+download to temporary file
+        |
+verify expected length
+        |
+verify checksum when configured
+        |
+close file
+        |
+atomically promote into cache
+```
+
+If cached bytes cannot be opened as an SST, they are evicted and the reader makes a fresh attempt against object storage. Temporary downloads are removed on every error path.
+
+The cache also reconciles its directory when it opens. IsleDB cache filenames are truncated hashes, so a new process cannot recover the original object key from an old filename and safely rebuild the in-memory index. Leaving those files behind would also put their bytes outside normal size accounting and eviction. Stale cache artifacts are removed at startup.
+
+> _The object store is authoritative. The local cache must always be willing to distrust itself._
+
+## Pinned views and snapshots
+
+A reader needs more than a set of SST IDs. It needs those SSTs to remain available for the lifetime of the view.
+
+Suppose a reader loads manifest generation 100. Maintenance publishes generation 101, where several old SSTs have been replaced by a compacted output. Those SSTs are no longer visible to new readers, but the old reader may still be using them.
+
+Deleting A, B, and C immediately after publishing D would break reader 100.
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-11-be65a79b.png" alt="Compaction publish first" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>Compaction publish first</figcaption>
+</figure>
+
+_Logical replacement and physical deletion are two different events._
+
+IsleDB persists a maximum pinned-view age as store policy. A reader view has an expiry derived from that policy. Reclamation waits for the publication observation time, the pinned-view window, and a safety margin before physically deleting retired objects.
+
+The policy connects both sides of the protocol:
+
+-   Readers promise not to use a view forever.
+-   Reclamation promises not to delete objects before every legal old view has expired.
+
+Snapshots follow the same lifetime rule. They provide a stable view, not permanent retention of every historical SST.
+
+## Compaction on object storage
+
+L0 SSTs may overlap. Reads become more expensive as L0 grows because multiple files may contain the same key. Lower levels keep non-overlapping key ranges so a point lookup can select at most one SST from each level.
+
+Compaction restores this structure:
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-12-10253280.png" alt="after compaction" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>after compaction</figcaption>
+</figure>
+
+_Compaction reads old immutable runs and writes new immutable runs._
+
+The important object-storage property is that compaction does not rewrite A, B, C, or D. It reads them and writes new immutable SSTs E and F.
+
+Again, the LSM model fits the storage model naturally.
+
+But compaction has two phases with different safety:
+
+1.  Preparing replacement SSTs is speculative. If the process dies, the outputs can be abandoned.
+2.  Publishing the new topology changes database visibility and must coordinate with the writer.
+
+In IsleDB, maintenance can run in a separate process. It prepares compaction, checkpoint, and change-feed retention work, then places one command in `maintenance/HEAD`. The active writer applies or rejects that command and records the receipt in the same conditional `CURRENT` update as the command's effect.
+
+<figure>
+  <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-13-f8e84d67.png" alt="maintenance writer protocol" width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>maintenance writer protocol</figcaption>
+</figure>
+
+_Maintenance prepares the candidate state, while the writer remains the visibility authority._
+
+This split keeps the writer as the publication authority while allowing expensive maintenance work to run elsewhere.
+
+It also means a slow deletion request never has to sit inside the writer’s commit path.
+
+## Why garbage collection is harder than uploading
+
+An extra immutable object costs storage. A prematurely deleted immutable object can make committed data unreadable.
+
+That gives garbage collection a deliberately asymmetric rule:
+
+> _When uncertain, leak the object. Never guess that committed data is safe to delete._
+
+An SST becomes eligible for deletion only after durable evidence shows that:
+
+1.  A committed manifest no longer references it.
+2.  The maintenance command that retired it was applied.
+3.  A replacement state is visible through `CURRENT`.
+4.  Every older legal pinned view has had time to expire.
+5.  The exact target path, size, and identity pass validation.
+
+The handoff is stored as an immutable deletion plan:
+
+```bash
+manifest/gc/sst/ready/<plan-id>.json
+```
+
+The plan contains bounded targets, a checksum, and a `NotBefore` deadline. A reclaimer scans plans in bounded batches, deletes target objects, and deletes the plan only after the target work completes.
+
+If the maintenance process dies halfway through, the plan remains. A replacement process can continue it. Repeating a delete for an already absent target is much easier to reason about than reconstructing deletion intent from memory after a crash.
+
+Change-feed batches, manifest snapshots, and manifest pages have their own reclamation lanes because they have different reachability and retention rules. The lanes progress independently so one slow family cannot stop every other cleanup activity.
+
+## Time is also part of the protocol
+
+Safety deadlines look simple until multiple machines have different clocks.
+
+If a deletion deadline is based directly on a remote writer’s timestamp, clock skew can move the deadline into the past. A newly retired object may then appear immediately eligible for deletion.
+
+The safer anchor is local observation of the published state. Once the maintenance process observes the committed floor or retirement receipt, it starts the local pinned-view and safety window from that point.
+
+```typescript
+ObservedAt + MaxPinnedViewAge + SafetyMargin
+```
+
+This may retain an object slightly longer than necessary. That is acceptable. The opposite error can delete data still in use.
+
+## Change feed: one more immutable companion to the SST
+
+An SST materializes the key-value mutations in one flush. Downstream consumers often need the mutation history instead.
+
+When the change feed is enabled, each flush writes a second immutable object containing the ordered PUT and DELETE records for the same sequence range.
+
+```lua
+Memtable flush
+    |
+    +-- SST object          materialized KV state
+    |
+    +-- change batch        ordered mutations
+    |
+    +-- one CURRENT update publishes both
+```
+
+The SST and change batch are uploaded concurrently, but they become visible together through the same writer commit. A manifest entry cannot publish only one side when the feed is configured.
+
+Change batches are block-compressed and end with an index, so a consumer can range-read only the blocks required for one page. Retention first advances a logical feed floor in `CURRENT`. Physical deletion happens later after the view-safety deadline.
+
+Again, logical visibility moves before physical bytes disappear.
+
+## Multipart upload has its own lifecycle
+
+Large object uploads may use S3 multipart upload. Parts can be retried independently and the final object appears when the multipart upload is completed. But uploaded parts remain stored until the upload is completed or aborted.
+
+This creates storage outside the database’s logical object graph. An incomplete multipart upload has no completed object for `CURRENT` to reference, and normal database garbage collection does not see its parts.
+
+AWS recommends aborting incomplete uploads explicitly or configuring the `AbortIncompleteMultipartUpload` lifecycle action. [Incomplete parts continue consuming storage until completion or abort](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html).
+
+This is one of the few places where a provider lifecycle policy is useful around a live database prefix. A generic age-based rule that deletes ordinary SSTs is dangerous because the provider does not understand manifest reachability. A rule scoped specifically to incomplete multipart uploads cleans provider-owned temporary state without guessing about database state.
+
+## What object storage changed in the engine
+
+At the beginning, it looked like the main change would be replacing file reads and writes with object GET and PUT.
+
+The actual changes went much deeper:
+
+-   A file no longer becomes visible through rename. Immutable objects become visible through a conditional `CURRENT` publication.
+-   A reader does not open a directory to discover files. It follows exact manifest references.
+-   Ownership is no longer implied by one local process. Writer and maintenance fences are persisted.
+-   A failed remote write cannot always be retried blindly. Unknown outcomes are reconciled through stable commit identities.
+-   Compacted files cannot be deleted immediately. Reclamation uses durable plans and waits for pinned views.
+-   A local cache is no longer the file. It is disposable and verified against manifest metadata.
+-   Manifest history cannot grow forever in one mutable object. It rotates into immutable pages and snapshots.
+-   Cleanup does not have to run as one background thread. Fenced maintenance can run as a separate service.
+
+## Closing
+
+S3 gives us durable objects, enormous capacity, and a storage service whose replication we do not operate ourselves. But it does not become a database merely because we put SST files in a bucket.
+
+The LSM tree gives us the right data building blocks. Memtables batch writes. SSTs give us immutable sorted data. Tombstones avoid in-place deletes. Compaction replaces old runs with new runs.
+
+What we still have to build is the meaning around those objects.
+
+Which object is visible? Who is allowed to publish it? What if the result is uncertain? How long can an old reader retain it? When is deletion safe? How can another process resume after a crash?
+
+For IsleDB, the answer is a small conditional visibility authority surrounded by immutable data and metadata objects.
+
+```markdown
+Immutable data
+      +
+Immutable history
+      +
+Conditional CURRENT
+      +
+Fenced owners
+      +
+Delayed, planned deletion
+      =
+A recoverable database state on object storage
+```
+
+Object storage did not remove the hard database problems. It concentrated them into a smaller number of publication and lifecycle protocols.
+
+And once those protocols become the real transaction engine, they deserve the same care and invariants as the SST format itself.
+
+## Want to try the engine?
+
+The implementation discussed throughout this article is [IsleDB](https://www.isledb.com/), an open-source embedded key-value database written in Go. It uses object storage as its durability and capacity layer and supports S3, GCS, Azure Blob, MinIO, and local files.
+
+If these ideas match a system you are building, the [getting-started guide](https://github.com/ankur-anand/isledb/blob/main/README.md) shows how to write the first key. The complete [source code is on GitHub](https://github.com/ankur-anand/isledb).
+
+## References
+
+-   [IsleDB source code](https://github.com/ankur-anand/isledb)
+-   [Amazon S3 data consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)
+-   [Amazon S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+-   [Amazon S3 multipart upload overview](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)
+-   Go [`io.Pipe`](https://pkg.go.dev/io#Pipe)

@@ -1,0 +1,379 @@
+---
+title: "Timing Wheels: Expiring 10 Million Keys in Go"
+description: "How hierarchical timing wheels expire millions of cache entries efficiently in Go without periodic O(n) scans or a timer per key."
+publishedAt: 2025-10-04
+tags: ["Go", "Data structures", "Performance", "Caching"]
+draft: false
+socialImage: "/images/blog/killing-o-n-how-timing-wheels-expire-10-million-keys-effortlessly-in-golang/image-02-d70a8608.png"
+socialImageAlt: "Hand-drawn diagram of a hierarchical timing wheel with three concentric levels."
+canonicalUrl: "https://medium.com/@ankur_anand/killing-o-n-how-timing-wheels-expire-10-million-keys-effortlessly-in-golang-9a6b8709fd91"
+originalUrl: "https://medium.com/@ankur_anand/killing-o-n-how-timing-wheels-expire-10-million-keys-effortlessly-in-golang-9a6b8709fd91"
+legacyUrls: ["https://medium.com/@ankur_anand/killing-o-n-how-timing-wheels-expire-10-million-keys-effortlessly-in-golang-9a6b8709fd91"]
+---
+
+How to expire millions of cache entries without killing performance.
+
+Your Cache has 10 million entries. Each one expires after some TTL. Every Second, thousands of entries need to be removed.
+
+Sounds simple. Until you’re managing 10 million TTLs, at that scale, the naive O(n) scan loop collapses into a CPU hog, blocking reads for seconds and stalling the entire system.
+
+### “The Obvious Solution(That breaks at scale)”
+
+> _The simplest approach? Periodically walk through the map and delete expired entries._
+
+```go
+type SimpleScanCache struct {
+ data map[string]*ScanEntry
+ mu   sync.RWMutex
+}
+
+type ScanEntry struct {
+ Value     interface{}
+ ExpiresAt time.Time
+}
+
+func (c *SimpleScanCache) scanAndDelete() (int, time.Duration) {
+ c.mu.Lock()
+ defer c.mu.Unlock()
+
+ start := time.Now()
+ now := time.Now()
+ deleted := 0
+
+ for key, entry := range c.data {
+  if now.After(entry.ExpiresAt) {
+   delete(c.data, key)
+   deleted++
+  }
+ }
+
+ return deleted, time.Since(start)
+}
+```
+
+**Clean. Straightforward. Works great at a small scale.**
+
+> Every tick, we lock the map, scan all entries, and delete expired ones. Simple, but as the cache grows into millions of entries, this O(n) loop becomes a bottleneck.
+
+## Benchmark: Naive Scan Cache
+
+I ran benchmarks on a simple cache that scans all entries every second to delete expired keys.
+
+## Setup
+
+-   Cache sizes: **10K, 100K, 1M, 10M** entries
+-   TTL: random between **30–60 seconds**
+
+Measurements:
+
+-   **Avg scan time** (how long a cleanup takes)
+-   **CPU overhead** (percentage of 1s taken by scans)
+-   **Read latency under load** (when 10 goroutines are calling Get() while scans run)
+
+```markdown
+### Results (Single-Threaded Scan)
+
+| **Entries** | **Avg Scan Time** | **CPU Overhead** |
+|-------------|-------------------|------------------|
+| 10K         | 5.5 ms            | 0.5%             |
+| 100K        | 48.6 ms           | 4.8%             |
+| 1M          | 275 ms            | 27.5%            |
+| 10M         | 2.29 s            | 229% (!!)        |
+
+### Results (With Concurrent Reads)
+
+| **Entries** | **Avg Scan Time** | **Avg Read Latency** | **Max Read Latency** |
+|-------------|-------------------|-----------------------|-----------------------|
+| 100K        | 49 ms             | 0.47 ms               | 56 ms                 |
+| 1M          | 258 ms            | 2.6 ms                | 288 ms                |
+| 10M         | 2.67 s            | 27.7 ms               | 4.27 s       |
+```
+
+At small sizes, scans are cheap — just a few milliseconds. But once the cache grows:
+
+-   At **1M entries**, each scan burns **~275 ms** and blocks reads for hundreds of milliseconds.
+-   At **10M entries**, scans take **seconds**, consuming **multiple CPUs** and stalling reads for **over 4 seconds**.
+
+> _“At 10 million entries, cleanup takes longer than a second — the system can’t even keep up with time.”_
+
+The naive scan loop is fine for small caches, but at scale it collapses under its **O(n)** cost, turning expiration into a CPU hog and a latency nightmare.
+
+This is evident from the pure scan analysis.
+
+Even without concurrent reads, the numbers make the problem clear:
+
+```markdown
+### Scaling Analysis
+
+| **Entries** | **Scan Time** |
+|-------------|---------------|
+| 1K          | 0.91 ms       |
+| 10K         | 5.25 ms       |
+| 100K        | 46.69 ms      |
+| 1M          | 339.87 ms     |
+| 10M         | 6003.91 ms    |
+```
+
+-   **10K entries** → ~5 ms per scan, negligible.
+-   **100K entries** → ~50 ms per scan, already noticeable.
+-   **1M entries** → ~340 ms per scan, a third of the second gone.
+-   **10M entries** → **6 seconds per scan** — longer than the interval itself!
+
+The naive _scan-and-delete_ loop looks fine at first glance. At 10K or even 100K entries, it’s barely noticeable. But once the cache crosses into the **millions**, the cost of scanning every entry becomes impossible to ignore:
+
+-   **CPU cycles are wasted** checking items that won’t expire for seconds or minutes.
+-   **Read operations are blocked** during scans, resulting in latency spikes ranging from milliseconds to seconds.
+-   **Expiration falls behind time** — at 10M entries, one cleanup pass takes longer than a full second.
+
+In short: **O(n) expiration doesn’t scale.**
+
+## From O(n) Scans to O(1) Expiration
+
+At this point, the problem is clear:
+
+Our naive scan loop wastes CPU cycles checking millions of entries that won’t expire for seconds or minutes — all while blocking reads and stalling the system.
+
+> So what if we flipped the problem around?
+
+Instead of repeatedly scanning every key, what if we only looked at the ones that are actually due to expire _right now_?
+
+That’s the core idea behind **Timing Wheels**:
+
+-   **Bucketize by time:** entries are grouped into buckets based on their expiration.
+-   **Process only what’s due:** on each tick, you empty just the current bucket.
+-   **Constant-time expiration:** cost is proportional to items expiring now, not the entire cache.
+
+Think of it like a **round-robin of expiry buckets**, or a **clock face** where each slot is a slice of time.
+
+Instead of one giant O(n) scan, you simply empty “today’s bucket” and move the hand forward.
+
+> This idea was first formalized in [Varghese & Lauck (1997)](http://www.cs.columbia.edu/~nahum/w6998/papers/ton97-timing-wheels.pdf), the “Hashed and Hierarchical Timing Wheels” paper.
+
+> This same approach powers real systems too — Linux kernel timers, Netty’s HashedWheelTimer, and Kafka’s delayed operation purgatory all build on this idea.
+
+### Single-Level Timing Wheel: Expire What’s Due Now
+
+Imagine time as a **clock**. Each tick is a second.
+
+Instead of one giant list of keys, you keep **buckets** — one for each slice of time.
+
+-   Put keys expiring in 5 seconds into bucket \[+5\].
+-   When the clock hand points to \[+5\], you empty just that bucket.
+-   Next second, move to the next bucket. And so on.
+
+Now, expiration isn’t “scan everything.” It’s “process exactly what’s due.”
+
+<figure>
+  <img src="/images/blog/killing-o-n-how-timing-wheels-expire-10-million-keys-effortlessly-in-golang/image-01-ab04f539.png" alt="timewheel single level" width="1492" height="471" loading="lazy" decoding="async" />
+  <figcaption>timewheel single level</figcaption>
+</figure>
+
+-   Insert “key with TTL=5s” → goes to (now + 5s) % 60.
+-   Each second, we advance the pointer and expire just that bucket.
+
+## Building the First Wheel
+
+We start small: a **single-level timing wheel** — a circular array of buckets.
+
+Each bucket holds entries that expire in that slot.
+
+```go
+
+type entry struct {
+    key   string
+    value any
+}
+
+type Wheel struct {
+    tick       time.Duration
+    slotCount  int
+    cur        int
+    slots      [][]entry
+    mu         sync.Mutex
+    stop       chan struct{}
+    expireFunc func(e entry)
+}
+
+func NewWheel(tick time.Duration, slotCount int, onExpire func(e entry)) *Wheel {
+    return &Wheel{
+        tick:       tick,
+        slotCount:  slotCount,
+        slots:      make([][]entry, slotCount),
+        stop:       make(chan struct{}),
+        expireFunc: onExpire,
+    }
+}
+```
+
+When a key arrives with a TTL, we compute **how many ticks ahead** it lands, and drop it into that bucket:
+
+```go
+func (w *Wheel) Add(key string, val any, ttl time.Duration) {
+    if ttl < 0 { ttl = 0 }
+    ticks := int(ttl / w.tick)
+    if ticks == 0 && ttl > 0 { ticks = 1 }
+    pos := (w.cur + ticks) % w.slotCount
+
+    w.mu.Lock()
+    w.slots[pos] = append(w.slots[pos], entry{key: key, value: val})
+    w.mu.Unlock()
+}
+```
+
+Every tick, we advance the pointer, grab the bucket, unlock, and process it outside the lock:
+
+```go
+func (w *Wheel) Start() {
+    t := time.NewTicker(w.tick)
+    go func() {
+        for {
+            select {
+            case <-t.C:
+                w.tickOnce()
+            case <-w.stop:
+                t.Stop(); return
+            }
+        }
+    }()
+}
+
+func (w *Wheel) Stop() { close(w.stop) }
+
+func (w *Wheel) tickOnce() {
+    w.mu.Lock()
+    bucket := w.slots[w.cur]
+    w.slots[w.cur] = nil
+    w.cur = (w.cur + 1) % w.slotCount
+    w.mu.Unlock()
+
+    // process outside the lock
+    for _, e := range bucket {
+        w.expireFunc(e)
+    }
+}
+```
+
+## Hooking It to a Cache
+
+Wire the wheel into a tiny map-backed cache. When a bucket fires, we delete those keys.
+
+```go
+type Cache struct {
+    mu   sync.RWMutex
+    data map[string]any
+    tw   *timingwheel.Wheel
+}
+
+func NewCache() *Cache {
+    c := &Cache{data: make(map[string]any)}
+    c.tw = timingwheel.NewWheel(time.Second, 60, func(e timingwheel.Entry /* exported in your pkg */) {
+        c.mu.Lock()
+        // expire
+        delete(c.data, e.Key)
+        c.mu.Unlock()
+    })
+    c.tw.Start()
+    return c
+}
+
+func (c *Cache) Set(key string, val any, ttl time.Duration) {
+    c.mu.Lock()
+    c.data[key] = val
+    c.mu.Unlock()
+    c.tw.Add(key, val, ttl)
+}
+
+func (c *Cache) Get(key string) (any, bool) {
+    c.mu.RLock(); v, ok := c.data[key]; c.mu.RUnlock()
+    return v, ok
+}
+```
+
+Expiration now costs **O(k)** per tick — where _k_ is “what actually expires this second.”
+
+We run the same experiment — this time measuring reader impact during expiration.
+
+```markdown
+### Results (Optimized Timing Wheel)
+
+| **Entries** | **Avg Read Latency** | **Max Read Latency** |
+|--------------|----------------------|----------------------|
+| 100K         | 2.3 µs               | 900 µs               |
+| 1M           | 1.7 µs               | 164 µs               |
+| 10M          | 3.15 µs              | 2.54 ms              |
+```
+
+Averages drop into the **microseconds**, and the **tail latencies go quiet**.
+
+## Why the Wheel Wins
+
+The difference is simple but profound:
+
+-   **Naive scan:** pays the price for _every_ key, _every_ second.
+-   **Timing wheel:** pays only for what’s _actually due_ right now — and nothing else.
+
+The results speak for themselves:
+
+-   **Naive (10M keys):** 2.29 s per scan, 4.27 s worst-case read stall.
+-   **Timing wheel (10M keys):** microsecond-level reads, no full-map sweeps.
+
+We didn’t make the hardware faster —
+
+**We just stopped wasting it.**
+
+## Where We Go Next
+
+A single timing wheel gets you **seconds** of precision — enough for many use cases. But real systems often need to track expirations over **minutes, hours, or even days**.
+
+The solution? **Stack the wheels.**
+
+<figure>
+  <img src="/images/blog/killing-o-n-how-timing-wheels-expire-10-million-keys-effortlessly-in-golang/image-02-d70a8608.png" alt="hierarchical timing wheel" width="1480" height="1303" loading="lazy" decoding="async" />
+  <figcaption>hierarchical timing wheel</figcaption>
+</figure>
+
+Each level represents a broader time span — seconds feed into minutes, minutes feed into hours, and so on.
+
+When a lower-level wheel wraps around, it cascades timers down to the next one. That’s the _hierarchical_ part:
+
+**Seconds → Minutes → Hours → Days**
+
+Same principle, just layered.
+
+Each tick still runs in constant time, no matter how wide the horizon grows.
+
+<figure>
+  <img src="/images/blog/killing-o-n-how-timing-wheels-expire-10-million-keys-effortlessly-in-golang/image-03-06e5950d.png" alt="hierarchical timing wheel" width="3840" height="873" loading="lazy" decoding="async" />
+  <figcaption>hierarchical timing wheel</figcaption>
+</figure>
+
+At 10 million keys, the naive scan loop **sinks under its own weight.**
+
+The timing wheel, though?
+
+**It just keeps ticking.**
+
+## Code & Repo
+
+The code for this blog post — including the single-level and hierarchical timing wheel implementations, along with benchmark tests — is available here:
+
+[**GitHub: ankur-anand/taskwheel**](https://github.com/ankur-anand/taskwheel)
+
+Clone, run the benchmarks, and see how the wheel scales compared to naive scans:
+
+```bash
+git clone https://github.com/ankur-anand/taskwheel.git
+cd taskwheel/examples/cache
+go test -tags=examples -bench=. -benchmem -v
+```
+
+## Benchmark Environment
+
+All benchmarks in this post were run locally on:
+
+-   **Machine**: Apple MacBook Pro (M2 Pro)
+-   **CPU**: 10 cores (6 performance, 4 efficiency)
+-   **Memory**: 16 GB RAM
+-   **OS**: macOS (Darwin/arm64)
+
+**Disclaimer**: Results will vary across hardware and workloads, but the scaling behaviour (O(n) scan vs O(1) wheel) holds across environments.

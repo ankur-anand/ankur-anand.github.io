@@ -1,0 +1,139 @@
+---
+title: "Building Express.js from Scratch, Part 1"
+description: "Build a small Express-like framework in Node.js, starting with an HTTP server and GET routes, then adding Router, Route, and Layer abstractions."
+publishedAt: 2018-03-23
+tags: ["JavaScript", "Node.js", "Express"]
+draft: false
+canonicalUrl: "https://medium.com/@ankur_anand/learning-express-js-by-creating-one-from-scratch-part-1-906ec5872a0a"
+originalUrl: "https://medium.com/@ankur_anand/learning-express-js-by-creating-one-from-scratch-part-1-906ec5872a0a"
+legacyUrls: ["https://medium.com/@ankur_anand/learning-express-js-by-creating-one-from-scratch-part-1-906ec5872a0a"]
+---
+
+The main focus of this article is to advance my knowledge regarding the [express.js](https://expressjs.com/) and understand the source code of express.
+
+<figure>
+  <img src="/images/blog/learning-express-js-by-creating-one-from-scratch-part-1/image-01-da95d916.jpg" alt="Quote graphic reading: Let's grab a few minutes from life and connect with Express.js code" width="336" height="280" loading="lazy" decoding="async" />
+</figure>
+
+Let’s start from the official example of Hello-world. But before we start lets confirm the directory structure. We are calling our lib as `mini-expressjs`.
+
+<figure>
+  <img src="/images/blog/learning-express-js-by-creating-one-from-scratch-part-1/image-02-803c6b7e.png" alt="mini-expressjs directory tree with index.js, lib/miniExpress.js, and test/index.js" width="258" height="102" loading="lazy" decoding="async" />
+</figure>
+
+## **1\. First Version**
+
+In the first version of our code, we will implement two functionality.
+
+1.  http server.
+2.  `get` route request
+
+Let’s create a `createApplication` function that exposes two function `listen` and `get` .
+
+`listen` function **intercept all HTTP request**, so that our mini-expressjs can analyze each HTTP request and can handle different business logic according to the different HTTP request. To expose this we can create an `http.createServer` and return this value from a `listen` function.
+
+creating an `http server` can be done with the examples provided on the node.js official site.
+
+Each HTTP request can be distinguished by the policies included in the URL’s. Like HTTP request noun, user-agent and so-on.
+
+All the frameworks have different some sort of **Routing Management.** In our case we need a set of functions for managing HTTP requests and map it to the business logic. For this version we are going to implement `get` function that will be responsible for adding the get requests.
+
+Basic Properties of each route abstracted from expressjs framework:
+
+-   Request path, for example: `/foo` , `/bar` .
+-   Request Method, for example: `GET` , `POST` , `PUT`, `DELETE` .
+-   Handle, Request Handler.
+
+Let’s create an array of router to manage all of the route in our app. `router[0]` contains the handle function if none of the match is successful.
+
+let’s modify the `listen` function to intercept the HTTP request and match the router routing table.
+
+Let’s us implement the `get route request`. This function will simply add the get request route information to the `router` array.
+
+But before we start our server and run the code, we have to add `res.send` function as this function is not a nodejs native function. This function is added on the `res` object.
+
+Our final version of listen function till now.
+
+All the code till this point can be found on [v1-tree-of-repo](https://github.com/ankur-anand/mini-expressjs/tree/v1) . Clone it go to test folder run and visit browser, you will see “Hello World” printed.
+
+<figure>
+  <img src="/images/blog/learning-express-js-by-creating-one-from-scratch-part-1/image-03-fbc1f8e5.jpg" alt="Meme of Donald Trump holding a folder labeled Seems like years and Still at Hello World" width="610" height="500" loading="lazy" decoding="async" />
+</figure>
+
+## **2\. Second Version**
+
+Let’s start the second iteration of our initial version of mini-expressjs. The Goal of this version is to **enhance our routing system.**
+
+In `expressjs` The Routing System is composed of Three Class
+
+1.  **Router**
+2.  **Route**
+3.  **Layer**
+
+<figure>
+  <img src="/images/blog/learning-express-js-by-creating-one-from-scratch-part-1/image-04-853c8c49.jpg" alt="expressjs routing system structure" width="1002" height="421" loading="lazy" decoding="async" />
+  <figcaption>expressjs routing system structure</figcaption>
+</figure>
+
+Lets first dismantle the above structure of the expressjs routing system.
+
+The Router inside the application represent’s the routing component and is responsible for the entire routing system of the application.
+
+> Each Instance of `Router` consists of an array of `Layers`, and each Layer represents a set of routing information with the same path. The specific information is stored inside the instance of the `Route` class, where each route is also a `Layer` Object.
+
+However, the Layer inside the Route and the Layer inside the Router contains different information.
+
+-   The Layer inside the Router mainly contains the `path` and `route`.
+-   The Layer inside the Route mainly contains the `method` and `handle`.
+
+Simply put when request comes, each layer inside the router is scanned from beginning to end, `path` gets compared first and the `methods` for that path is compared inside the `route`. If the match is successful, the specific information is returned otherwise return not found.
+
+So in Our Application, a route will be composed of three parts: `path`, `methods`, and `handlers`. The relationship between the `path` and `methods` is `one-to-many`, example
+
+```
+GET foo/1
+PUT foo/1
+POST foo/1
+```
+
+> So if we continue to add the routes to normal array like this, our number of routes will continue to increase drastically and the matching efficiency will continue to decrease.
+
+But if we can combine the routes with the same route into a group, our efficiency will increase a lot and so the concept of `layer` was introduced at the `expressjs`. Lets implement the same in our `mini-express` where array in the Router system represents a `layer` and each `layer` contains three properties.
+
+-   **Path**, path of the route.
+-   **Handle**, function to handle the request.
+-   **Route**, the real route.
+
+Lets Implement Layer class
+
+and each item of our Router class now represents a Layer.
+
+Let’s encapsulate the routing data and operations inside the Router class.
+
+However if you look closely till now our program can’t distinguish between HTTP verbs now. Therefore we need to tell our `Router` to somehow figure out, and that is done through the route attribute stored inside the Router.
+
+`Route.js`
+
+Let’s change our `Router` class to use the new `Route` System.
+
+Volha! Start the app from the test folder again and now our app can distinguish between different method too. ☺️
+
+You Can find the code till now at [v2-branch](https://github.com/ankur-anand/mini-expressjs/tree/v2).
+
+So with that in place we have created a mini sized version of the expressjs routing system for our application.
+
+Still mini sized version only ? Oh Yes, because Just Like her
+
+<figure>
+  <img src="/images/blog/learning-express-js-by-creating-one-from-scratch-part-1/image-05-16d75581.jpg" alt="Confused grandmother meme reading: Honey, I think I bought a nuclear warhead" width="640" height="480" loading="lazy" decoding="async" />
+</figure>
+
+### So in the next Post, I will be continue improving our routing system that supports Rich interface and middleware .
+
+Stay Tuned!
+
+<figure>
+  <img src="/images/blog/learning-express-js-by-creating-one-from-scratch-part-1/image-06-4affb29f.png" alt="Codeburst.io logo" width="1197" height="45" loading="lazy" decoding="async" />
+</figure>
+
+> ✉️ _Subscribe to_ CodeBurst’s _once-weekly_ [**_Email Blast_**](http://bit.ly/codeburst-email)**_,_** 🐦 _Follow_ CodeBurst _on_ [**_Twitter_**](http://bit.ly/codeburst-twitter)_, view_ 🗺️ [**_The 2018 Web Developer Roadmap_**](http://bit.ly/2018-web-dev-roadmap)_, and_ 🕸️ [**_Learn Full Stack Web Development_**](http://bit.ly/learn-web-dev-codeburst)_._
