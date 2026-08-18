@@ -1,6 +1,6 @@
 export const SITE = {
   name: "Ankur Anand",
-  title: "Ankur Anand — Software Engineer & Writer",
+  title: "Ankur Anand — Software Engineer",
   description:
     "Long-form writing about Go, distributed systems, databases, performance, and the craft of building software.",
   url: "https://ankuranand.com",

@@ -31,7 +31,7 @@ export const getStaticPaths: GetStaticPaths = async () => {
     {
       slug: "home",
       card: {
-        eyebrow: "Software engineer and writer",
+        eyebrow: "Software engineer",
         title: "Ankur Anand",
         footer: "Go · Distributed systems · Databases · Performance",
       },
