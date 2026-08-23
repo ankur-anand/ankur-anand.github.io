@@ -1,0 +1,688 @@
+---
+title: "Go singleflight: Cancellation and Shutdown"
+description: "Learn how Go singleflight prevents cache stampedes, why caller cancellation gets tricky, and how to safely cancel and drain shared work during shutdown."
+publishedAt: 2026-08-23
+tags: ["Go", "Concurrency", "Caching", "singleflight"]
+draft: false
+featured: false
+socialImage: "/images/blog/go-singleflight-cancellation-shutdown/01-from-stampede-to-one-flight.png"
+socialImageAlt: "Many concurrent cache misses being coalesced into one backend request."
+legacyUrls: []
+---
+
+## Deduplicating work is easy. Owning its lifetime is harder.
+
+In [IsleDB](https://isledb.com), several goroutines can miss the local cache for the same SST byte range at the same time. Without coordination, each one sends an identical range request to S3.
+
+Go's [`singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight) package can collapse those requests into one shared fetch. But once work is shared, another question appears:
+
+> Who owns its lifetime?
+
+If the fetch uses the first caller's context, that caller can cancel the operation for everyone. If the fetch is detached from every caller, it can continue after nobody needs it—or return while the database is shutting down.
+
+I will start with a small cache loader, then show how I turned it into the concurrency protocol behind IsleDB's S3 loader. The final design provides three guarantees:
+
+1. Every caller can stop waiting independently.
+2. The shared operation is canceled when its final waiter leaves.
+3. Shutdown rejects new calls, cancels active work, and waits for every worker to stop.
+
+If cache stampedes and basic `singleflight` usage are already familiar, skip ahead to [the first-caller context trap](#the-first-caller-accidentally-becomes-the-owner). Otherwise, begin with the harmless-looking cache loader below:
+
+```go
+var cache sync.Map
+
+func load(ctx context.Context, key string) (string, error) {
+	if value, ok := cache.Load(key); ok {
+		return value.(string), nil
+	}
+
+	value, err := fetch(ctx, key)
+	if err != nil {
+		return "", err
+	}
+
+	cache.Store(key, value)
+	return value, nil
+}
+```
+
+It checks the cache, fetches a missing value, and stores the result. With one goroutine, that is the whole story. With many goroutines asking for the same absent key, it is only the beginning.
+
+## A concurrency-safe cache can still stampede
+
+Suppose the backend takes 100 milliseconds and records how often it is called:
+
+```go
+var backendCalls atomic.Int64
+
+func fetch(ctx context.Context, key string) (string, error) {
+	backendCalls.Add(1)
+
+	select {
+	case <-time.After(100 * time.Millisecond):
+		return "value for " + key, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+```
+
+Now release 32 goroutines at once:
+
+```go
+const workers = 32
+
+start := make(chan struct{})
+var wg sync.WaitGroup
+
+for i := 0; i < workers; i++ {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, _ = load(context.Background(), "homepage")
+	}()
+}
+
+close(start)
+wg.Wait()
+
+fmt.Println("backend calls:", backendCalls.Load())
+```
+
+A typical result is:
+
+```text
+backend calls: 32
+```
+
+There is no data race here. `sync.Map` is safe, and every lookup is accurate at the instant it happens. The problem is that the cache remembers only completed work. Until one fetch stores a value, it cannot tell callers that an equivalent fetch is already running.
+
+<figure>
+  <img src="/images/blog/go-singleflight-cancellation-shutdown/01-from-stampede-to-one-flight.svg" alt="Without coalescing, concurrent cache misses each reach the backend; with singleflight, they join one keyed request." width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>A cache shares completed results; singleflight shares work that is still in progress.</figcaption>
+</figure>
+
+This is the **thundering herd problem**, or, in this particular setting, a **cache stampede**.
+
+## Why one mutex is the wrong shape
+
+A double-checked mutex stops the duplicate fetches:
+
+```go
+var loadMu sync.Mutex
+
+func load(ctx context.Context, key string) (string, error) {
+	if value, ok := cache.Load(key); ok {
+		return value.(string), nil
+	}
+
+	loadMu.Lock()
+	defer loadMu.Unlock()
+
+	if value, ok := cache.Load(key); ok {
+		return value.(string), nil
+	}
+
+	value, err := fetch(ctx, key)
+	if err != nil {
+		return "", err
+	}
+
+	cache.Store(key, value)
+	return value, nil
+}
+```
+
+But it also serializes unrelated keys:
+
+```text
+load("homepage") ── holds loadMu for 100 ms
+load("settings") ── waits, although it needs different data
+```
+
+The lock must be scoped to the logical operation, not the whole loader:
+
+```text
+"homepage" → one fetch, many waiters
+"settings" → another fetch, many waiters
+```
+
+That is the shape of a `singleflight.Group`.
+
+## `singleflight` shares a flight, not a cache entry
+
+For each key, [`Group.Do`](https://pkg.go.dev/golang.org/x/sync/singleflight#Group.Do) runs at most one function at a time. Duplicate callers wait for that function and receive the same value and error.
+
+```go
+var loads singleflight.Group
+
+func load(ctx context.Context, key string) (string, error) {
+	if value, ok := cache.Load(key); ok {
+		return value.(string), nil
+	}
+
+	result, err, _ := loads.Do(key, func() (any, error) {
+		if value, ok := cache.Load(key); ok {
+			return value.(string), nil
+		}
+
+		value, err := fetch(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+
+		cache.Store(key, value)
+		return value, nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return result.(string), nil
+}
+```
+
+The first caller for `homepage` creates a call and runs the function. Later callers for `homepage` join that call. A caller for `settings` creates a separate call and proceeds concurrently.
+
+A simplified mental model is enough to understand the mechanism:
+
+```go
+type call struct {
+	wg  sync.WaitGroup
+	val any
+	err error
+}
+
+type Group struct {
+	mu    sync.Mutex
+	calls map[string]*call
+}
+```
+
+The first caller inserts a `call` into the map. Duplicates find the same pointer and wait on its `WaitGroup`. When the function finishes, every waiter reads the same result and the entry is removed.
+
+That final removal matters. `singleflight` forgets completed calls; it does not retain their values for future requests.
+
+```text
+singleflight → shares unfinished work
+cache        → shares completed work
+```
+
+### Why the cache is checked twice
+
+The second lookup inside `Do` closes a small but real race:
+
+```text
+1. G1 checks the cache: miss
+2. G2 checks the cache: miss
+3. G1 enters singleflight, fetches, stores, and finishes
+4. singleflight removes G1's completed call
+5. G2 enters singleflight
+```
+
+At step 5, there is no in-flight call for G2 to join. Without the inner lookup, G2 fetches the value again. The outer check keeps cache hits fast; the inner check protects the gap between the first lookup and joining the flight.
+
+## The first caller accidentally becomes the owner
+
+There is a lifetime trap in the otherwise-correct example:
+
+```go
+loads.Do(key, func() (any, error) {
+	return fetch(ctx, key)
+})
+```
+
+The function that actually runs is the function supplied by the first caller. Its closure captures that caller's `ctx`. A duplicate caller's function is never invoked.
+
+Call the first caller the **leader** and the duplicates **followers**. Now consider two cases.
+
+### Case 1: the leader times out first
+
+Caller A has a 50 ms deadline and becomes the leader. Caller B has two seconds left, but joins A's flight. The backend needs 100 ms.
+
+When A reaches its deadline, A's context cancels the shared backend request. B receives the same cancellation even though B was still willing to wait.
+
+### Case 2: a follower times out first
+
+Caller A has no deadline and becomes the leader. Caller B joins with a 50 ms deadline. The backend takes ten seconds.
+
+`Do` blocks B on the leader's call. It does not select on B's context, so B can remain stuck for ten seconds after its own deadline expires.
+
+<figure>
+  <img src="/images/blog/go-singleflight-cancellation-shutdown/02-two-context-traps.svg" alt="Two singleflight context traps: leader cancellation stops the shared fetch for every caller, while follower cancellation cannot interrupt a blocking Do wait." width="1600" height="820" loading="lazy" decoding="async" />
+  <figcaption>One captured context creates two opposite failure modes: too much cancellation for the shared work, and too little for an individual waiter.</figcaption>
+</figure>
+
+Neither behavior is a bug in `singleflight`. The group executes the first function and makes duplicates wait for it. The ownership policy came from our closure.
+
+## `DoChan` fixes waiting, not ownership
+
+[`DoChan`](https://pkg.go.dev/golang.org/x/sync/singleflight#Group.DoChan) lets each caller select on its own context:
+
+```go
+resultCh := loads.DoChan(key, func() (any, error) {
+	return fetch(ctx, key)
+})
+
+select {
+case <-ctx.Done():
+	return "", ctx.Err()
+case result := <-resultCh:
+	if result.Err != nil {
+		return "", result.Err
+	}
+	return result.Val.(string), nil
+}
+```
+
+Now a follower can stop waiting as soon as its context is canceled. Two details are easy to miss:
+
+- The returned channel receives one result but [is not closed](https://pkg.go.dev/golang.org/x/sync/singleflight#Group.DoChan), so receive once; do not range over it.
+- The function still captures the leader's context. If the leader cancels, the shared fetch still stops for everyone.
+
+`DoChan` changes **how callers wait**. It does not decide **who owns the operation**.
+
+## Pick an ownership policy deliberately
+
+There is no universally correct cancellation policy for shared work. Three policies are common:
+
+| Owner | What happens when callers cancel? | Good fit |
+| --- | --- | --- |
+| First caller | The leader can stop the work for everyone. | Work genuinely belongs to that request and followers accept its fate. |
+| Service or component | Caller cancellation only stops waiting; work continues until completion, an internal deadline, or shutdown. | Refreshes and cache fills worth completing even after clients leave. |
+| Current waiter set | One waiter can leave independently; the last waiter cancels the work. | Expensive demand-driven work with no value when nobody is waiting. |
+
+Replacing the captured context with `context.Background()` chooses the second policy incompletely:
+
+```go
+resultCh := loads.DoChan(key, func() (any, error) {
+	return fetch(context.Background(), key)
+})
+```
+
+The leader no longer controls the fetch, but neither does the component. If every caller leaves, the work continues. During shutdown, it may return after the cache or backend client has already closed.
+
+A service-owned context with an internal timeout can be exactly right. The mistake is detaching work without also giving its owner a cancellation path and a way to wait for it.
+
+The rest of this article focuses on the third policy: the current waiter set owns the call, while the containing component retains the power to stop everything during shutdown.
+
+## Why IsleDB needed more than `singleflight`
+
+This problem came from [IsleDB](https://github.com/ankur-anand/isledb), a key-value database that reads immutable SST data from S3-compatible object storage. When several goroutines miss the local cache for the same SST byte range, the naive path can issue the same S3 range request many times. The loader must collapse those misses into one remote read while still allowing each database operation to cancel its own wait.
+
+`golang.org/x/sync/singleflight` solves the duplicate-request problem, but not the ownership problem. As we saw above, the shared function can inherit the first caller's context, and a follower blocked in `Do` cannot leave promptly when its own context is canceled. [`resenje.org/singleflight`](https://pkg.go.dev/resenje.org/singleflight) provides the waiter-owned cancellation model and is used by [Moby](https://github.com/moby/moby/blob/master/daemon/daemon.go). If independently cancelable waiters are the whole requirement, use that package.
+
+IsleDB also needs the loader to participate in database shutdown. Once closing begins, it must reject new loads, cancel every in-flight S3 read with a recognizable shutdown cause, and wait until no loader worker can return into cache or object-store state being torn down. `resenje.org/singleflight` does not expose that group-wide `Close` and drain contract.
+
+The simplified implementation below walks through the concurrency protocol used for that loader. The custom group is not about suppressing duplicates differently; it adds a lifecycle boundary around the shared work.
+
+The group needs four pieces of state per key, plus owner-level shutdown state:
+
+```go
+type loadCall struct {
+	ctx      context.Context
+	cancel   context.CancelCauseFunc
+	done     chan struct{}
+	waiters  int
+	finished bool
+	value    any
+	err      error
+}
+
+type loadGroup struct {
+	mu       sync.Mutex
+	calls    map[string]*loadCall
+	active   sync.WaitGroup
+	closed   bool
+	closeErr error
+}
+```
+
+- `waiters` counts callers still interested in the result.
+- `ctx` belongs to the shared call, not to one waiter.
+- closing `done` publishes the result and wakes every waiter.
+- `active` lets shutdown wait for the worker goroutines.
+- `closed` prevents a `WaitGroup.Add` from racing with shutdown's `Wait`.
+
+<figure>
+  <img src="/images/blog/go-singleflight-cancellation-shutdown/03-shared-call-ownership.svg" alt="A load group owns one backend worker and shared context, while three callers wait independently and the final departing waiter cancels the worker." width="1600" height="820" loading="lazy" decoding="async" />
+  <figcaption>The call owns the backend context. Each caller owns only its wait.</figcaption>
+</figure>
+
+### Start or join a call
+
+`Do` rejects an already-canceled caller before touching group state, then either joins an existing call or creates a new one:
+
+```go
+func (g *loadGroup) Do(
+	ctx context.Context,
+	key string,
+	load func(context.Context) (any, error),
+) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	g.mu.Lock()
+	if g.closed {
+		err := g.closeErr
+		g.mu.Unlock()
+		return nil, err
+	}
+
+	if call := g.calls[key]; call != nil {
+		call.waiters++
+		g.mu.Unlock()
+		return g.wait(ctx, key, call)
+	}
+
+	if g.calls == nil {
+		g.calls = make(map[string]*loadCall)
+	}
+
+	callCtx, cancel := context.WithCancelCause(
+		context.WithoutCancel(ctx),
+	)
+	call := &loadCall{
+		ctx:     callCtx,
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		waiters: 1,
+	}
+
+	g.calls[key] = call
+	g.active.Add(1)
+	g.mu.Unlock()
+
+	go g.run(key, call, load)
+	return g.wait(ctx, key, call)
+}
+```
+
+The first caller does not run `load` inline. It starts a group-owned worker and then waits like everyone else. That separation is what allows the first caller to cancel its own wait without automatically canceling a call that still has followers.
+
+[`context.WithoutCancel`](https://pkg.go.dev/context#WithoutCancel) preserves values from the first context but removes its cancellation and deadline. `WithCancelCause` then adds a new cancellation signal owned by the group.
+
+This part of the example requires Go 1.21 or newer, when `WithoutCancel` was added.
+
+That value inheritance needs care. If tenant, authorization, locale, consistency level, or any other option can change the backend operation, it must be represented explicitly and included in the coalescing key. Never let one tenant's context accidentally authorize work shared with another. Use safe identity or policy dimensions in the key, not raw credentials that could leak through logs or metrics.
+
+An even cleaner design is to put operation inputs in a request value and derive the shared context from a component-owned base context. Context values should remain request-scoped metadata, not hidden function arguments.
+
+### Let every waiter leave independently
+
+Each caller waits for either its own cancellation or the shared result:
+
+```go
+func (g *loadGroup) wait(
+	ctx context.Context,
+	key string,
+	call *loadCall,
+) (any, error) {
+	select {
+	case <-ctx.Done():
+		g.releaseWaiter(key, call)
+		return nil, ctx.Err()
+
+	case <-call.done:
+		g.releaseWaiter(key, call)
+		return call.value, call.err
+	}
+}
+```
+
+Leaving decrements the waiter count. Only the last waiter cancels unfinished work:
+
+```go
+var errNoWaiters = errors.New("shared load has no waiters")
+
+func (g *loadGroup) releaseWaiter(key string, call *loadCall) {
+	var cancel bool
+
+	g.mu.Lock()
+	call.waiters--
+	if call.waiters == 0 && !call.finished {
+		if g.calls[key] == call {
+			delete(g.calls, key)
+		}
+		cancel = true
+	}
+	g.mu.Unlock()
+
+	if cancel {
+		call.cancel(errNoWaiters)
+	}
+}
+```
+
+Cancellation happens after releasing the mutex. A context-aware backend wakes up and may finish immediately; it should not have to contend on the group lock while cancellation is being propagated.
+
+The load function must observe its context. A group can send a cancellation signal, but it cannot forcibly stop code that ignores it.
+
+## The replacement-call race
+
+When the last waiter leaves, the old call is removed immediately and canceled. Its worker may take a little longer to return. Meanwhile, a new caller can start a replacement for the same key:
+
+```text
+1. calls["homepage"] points to oldCall
+2. its final waiter leaves; oldCall is removed and canceled
+3. a new caller inserts newCall under "homepage"
+4. the old worker finally returns
+```
+
+If step 4 blindly executes `delete(g.calls, key)`, it deletes `newCall`.
+
+<figure>
+  <img src="/images/blog/go-singleflight-cancellation-shutdown/04-replacement-call-race.svg" alt="An old canceled call finishes after a replacement call is registered for the same key; comparing call identity prevents the old worker from deleting the replacement." width="1600" height="820" loading="lazy" decoding="async" />
+  <figcaption>The key is the same, but the call identity has changed. Cleanup must check both.</figcaption>
+</figure>
+
+Completion must therefore use a compare-and-delete pattern:
+
+```go
+if g.calls[key] == call {
+	delete(g.calls, key)
+}
+```
+
+That pointer comparison is small, but it is the difference between cleaning up the old generation and corrupting the new one.
+
+## Publish the result before waking waiters
+
+The worker runs the backend function, records any group cancellation cause, publishes the result, and closes `done`:
+
+```go
+func (g *loadGroup) run(
+	key string,
+	call *loadCall,
+	load func(context.Context) (any, error),
+) {
+	value, err := load(call.ctx)
+	if cause := context.Cause(call.ctx); cause != nil {
+		value = nil
+		err = cause
+	}
+
+	g.mu.Lock()
+	call.value = value
+	call.err = err
+	call.finished = true
+
+	if g.calls[key] == call {
+		delete(g.calls, key)
+	}
+
+	close(call.done)
+	g.mu.Unlock()
+
+	call.cancel(context.Canceled)
+	g.active.Done()
+}
+```
+
+Writing `value` and `err` before closing `done` safely publishes them to waiters awakened by that close. A backend error is shared only with callers on this flight; because the call is removed, a later caller can start a fresh attempt.
+
+This compact implementation assumes `load` returns normally. The upstream `singleflight` package has deliberate behavior for panics and `runtime.Goexit`. Production code that accepts arbitrary callbacks needs its own explicit policy and deferred cleanup so a misbehaving callback cannot strand waiters or block shutdown forever.
+
+## Shutdown is part of the protocol
+
+Detached or group-owned work must stop before the resources it uses are closed:
+
+```go
+var ErrLoaderClosed = errors.New("loader is closed")
+
+func (g *loadGroup) Close(err error) {
+	if err == nil {
+		err = ErrLoaderClosed
+	}
+
+	var calls []*loadCall
+
+	g.mu.Lock()
+	if !g.closed {
+		g.closed = true
+		g.closeErr = err
+
+		for _, call := range g.calls {
+			calls = append(calls, call)
+		}
+	}
+	g.mu.Unlock()
+
+	for _, call := range calls {
+		call.cancel(err)
+	}
+
+	g.active.Wait()
+}
+```
+
+`Close` marks the group closed while holding the same mutex used by `Do`. That guarantees no new `active.Add(1)` can occur after shutdown begins, which is required for safe coordination with `Wait`.
+
+<figure>
+  <img src="/images/blog/go-singleflight-cancellation-shutdown/05-graceful-shutdown.svg" alt="Graceful shutdown flow: reject new calls, cancel active shared calls, wait for workers, then close the cache and backend." width="1600" height="820" loading="lazy" decoding="async" />
+  <figcaption>Close the work gate first, drain the workers, and only then tear down the resources they use.</figcaption>
+</figure>
+
+The containing loader should close in this order:
+
+```go
+func (l *Loader) Close() error {
+	l.loads.Close(ErrLoaderClosed)
+
+	if err := l.cache.Close(); err != nil {
+		return err
+	}
+	return l.backend.Close()
+}
+```
+
+Waiting is essential. Without it, a worker can return after `cache.Close` and try to store a result in state that has already been torn down.
+
+Shutdown can wait forever if a backend ignores cancellation. In a real service, make that contract explicit, instrument slow drains, and decide at a higher layer whether process shutdown has a hard deadline. Do not make `Close` secretly abandon a goroutine that can still touch closed resources.
+
+## Fit the group back into the cache loader
+
+The cache logic remains separate from in-flight coordination:
+
+```go
+type Loader struct {
+	cache Cache
+	loads loadGroup
+}
+
+func (l *Loader) Load(ctx context.Context, key string) (string, error) {
+	if value, ok := l.cache.Load(key); ok {
+		return value, nil
+	}
+
+	result, err := l.loads.Do(ctx, key, func(loadCtx context.Context) (any, error) {
+		if value, ok := l.cache.Load(key); ok {
+			return value, nil
+		}
+
+		value, err := fetch(loadCtx, key)
+		if err != nil {
+			return nil, err
+		}
+
+		l.cache.Store(key, value)
+		return value, nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return result.(string), nil
+}
+```
+
+The two layers now have distinct jobs:
+
+```text
+cache     → retain successful completed values
+loadGroup → coordinate the lifetime of unfinished loads
+```
+
+Whether errors should be cached, retried, or negatively cached is another policy. The group above shares an error with current waiters and then forgets it.
+
+## The key defines what may be shared
+
+`singleflight` does not compare the functions submitted by two callers. It trusts the key. When callers use the same key, they are asserting that one execution can produce a valid result for all of them.
+
+Suppose two IsleDB readers request different ranges from the same SST:
+
+```text
+key: sst:report-v3
+
+caller A → offset 0,    length 4096
+caller B → offset 4096, length 4096
+```
+
+If the key contains only the object name, B joins A's flight and receives A's bytes. The loader key must therefore describe the exact S3 read being shared:
+
+```text
+sst:<object-id>:<version>:<offset>:<length>
+```
+
+The same rule applies to tenant identity, storage namespace, or any authorization-sensitive configuration. If an input can change the operation or its result, it belongs in the key. Key design is therefore a correctness and isolation boundary, not merely a performance choice.
+
+The returned value is shared too. IsleDB treats coalesced load results as immutable; if an API gives callers mutable bytes, it must return a caller-owned copy at the boundary.
+
+## The real abstraction is ownership
+
+The first cache loader looked like one operation:
+
+```text
+cache miss → fetch → store
+```
+
+Concurrency revealed two different kinds of reusable state:
+
+```text
+completed value → owned by the cache
+in-flight work  → owned by a call with a lifetime policy
+```
+
+`singleflight` is excellent at suppressing duplicate calls. Its intentionally small API does not decide whether the leader, the component, or the current waiter set should own the work. That decision belongs to the application.
+
+If waiter-aware cancellation is enough, `resenje.org/singleflight` already implements it. A custom group becomes justified when the containing component also needs a stronger lifecycle contract: reject new work, cancel every active call with a known cause, and wait until no worker can touch the resources being closed.
+
+Once the policy is explicit, the edge cases become much easier to reason about:
+
+```text
+one key
+  → one shared call
+  → independently cancelable waiters
+  → cancellation when the final waiter leaves
+  → cancellation and draining before owner shutdown
+```
+
+The cache stampede is the visible problem. Ownership is the deeper one.
+
+## References and related implementations
+
+- [`golang.org/x/sync/singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight) is the small, widely used baseline for duplicate-call suppression.
+- [`resenje.org/singleflight`](https://github.com/janos/singleflight) adds generics and waiter-owned context cancellation. [Moby's daemon](https://github.com/moby/moby/blob/master/daemon/daemon.go) is a concrete production user.
+- [CockroachDB maintains its own singleflight implementation](https://github.com/cockroachdb/cockroach/blob/master/pkg/util/syncutil/singleflight/singleflight.go), integrated with its context, tracing, and stopper infrastructure. It explicitly documents the leader-cancellation behavior discussed above, so it is related prior art rather than an implementation of the exact ownership policy built here.

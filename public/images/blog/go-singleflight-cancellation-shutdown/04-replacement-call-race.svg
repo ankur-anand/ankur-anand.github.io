@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="820" viewBox="0 0 1600 820" role="img" aria-labelledby="title desc">
+  <title id="title">The same singleflight key can refer to a different call generation</title>
+  <desc id="desc">An old call is canceled and removed. A replacement call takes the same key before the old worker returns. Identity comparison prevents the old worker from deleting the replacement.</desc>
+
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="7" stdDeviation="10" flood-color="#334455" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="18" markerHeight="18" refX="17" refY="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L18,9 L0,18 Z" fill="#334455"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="18" markerHeight="18" refX="17" refY="9" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L18,9 L0,18 Z" fill="#087a51"/>
+    </marker>
+    <style>
+      .title { font: 700 50px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334455; }
+      .subtitle { font: 400 24px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #667788; }
+      .step { font: 700 22px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 1.2px; fill: #334455; }
+      .label { font: 700 28px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334455; }
+      .small { font: 400 23px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #667788; }
+      .code { font: 500 24px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #334455; }
+      .number { font: 700 24px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; }
+      .green { fill: #087a51; }
+      .red { fill: #d97857; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="820" fill="#f7f7f4"/>
+  <text x="64" y="70" class="title">Same key, different call</text>
+  <text x="64" y="112" class="subtitle">A canceled worker may finish after a replacement has claimed its key.</text>
+
+  <rect x="54" y="146" width="1492" height="624" rx="28" fill="#ffffff" filter="url(#shadow)"/>
+
+  <line x1="190" y1="250" x2="1410" y2="250" stroke="#d6dddf" stroke-width="6"/>
+
+  <text x="190" y="196" class="step" text-anchor="middle">OLD CALL RUNS</text>
+  <text x="596" y="196" class="step red" text-anchor="middle">LAST WAITER LEAVES</text>
+  <text x="1002" y="196" class="step green" text-anchor="middle">NEW CALL STARTS</text>
+  <text x="1410" y="196" class="step" text-anchor="middle">OLD CALL RETURNS</text>
+
+  <circle cx="190" cy="250" r="30" fill="#334455"/>
+  <text x="190" y="258" class="number" text-anchor="middle">1</text>
+  <circle cx="596" cy="250" r="30" fill="#d97857"/>
+  <text x="596" y="258" class="number" text-anchor="middle">2</text>
+  <circle cx="1002" cy="250" r="30" fill="#087a51"/>
+  <text x="1002" y="258" class="number" text-anchor="middle">3</text>
+  <circle cx="1410" cy="250" r="30" fill="#334455"/>
+  <text x="1410" y="258" class="number" text-anchor="middle">4</text>
+
+  <rect x="88" y="310" width="300" height="205" rx="22" fill="#eef2f3"/>
+  <text x="118" y="352" class="small">calls map</text>
+  <rect x="118" y="372" width="240" height="62" rx="13" fill="#ffffff" stroke="#cad4d7" stroke-width="2"/>
+  <text x="238" y="412" class="code" text-anchor="middle">homepage</text>
+  <path d="M238 442 V462" stroke="#334455" stroke-width="4" marker-end="url(#arrow)"/>
+  <text x="238" y="503" class="label" text-anchor="middle">oldCall</text>
+
+  <rect x="448" y="310" width="300" height="205" rx="22" fill="#f9ece7"/>
+  <text x="478" y="352" class="small">calls map</text>
+  <rect x="478" y="372" width="240" height="62" rx="13" fill="#ffffff" stroke="#e3a08a" stroke-width="2" stroke-dasharray="10 8"/>
+  <text x="598" y="412" class="code" text-anchor="middle" opacity="0.48">homepage</text>
+  <text x="598" y="468" class="label red" text-anchor="middle">entry removed</text>
+  <text x="598" y="499" class="small" text-anchor="middle">oldCall canceled</text>
+
+  <rect x="808" y="310" width="300" height="205" rx="22" fill="#e6f5ec"/>
+  <text x="838" y="352" class="small">calls map</text>
+  <rect x="838" y="372" width="240" height="62" rx="13" fill="#ffffff" stroke="#5bcf80" stroke-width="2"/>
+  <text x="958" y="412" class="code" text-anchor="middle">homepage</text>
+  <path d="M958 442 V462" stroke="#087a51" stroke-width="4" marker-end="url(#arrow-green)"/>
+  <text x="958" y="503" class="label green" text-anchor="middle">newCall</text>
+
+  <rect x="1168" y="310" width="344" height="205" rx="22" fill="#fffbea" stroke="#e2c84e" stroke-width="2"/>
+  <text x="1198" y="352" class="small">old worker checks</text>
+  <text x="1340" y="401" class="code" text-anchor="middle">calls[key]</text>
+  <text x="1340" y="438" class="label" text-anchor="middle">newCall ≠ oldCall</text>
+  <rect x="1222" y="460" width="236" height="40" rx="12" fill="#e3f4e9"/>
+  <text x="1340" y="489" class="label green" text-anchor="middle">KEEP</text>
+
+  <path d="M400 412 H434" fill="none" stroke="#334455" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M760 412 H794" fill="none" stroke="#334455" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M1120 412 H1154" fill="none" stroke="#334455" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <rect x="88" y="555" width="680" height="150" rx="20" fill="#f9ece7"/>
+  <text x="120" y="598" class="step red">UNSAFE: DELETE BY KEY</text>
+  <text x="120" y="642" class="code">delete(g.calls, key)</text>
+  <text x="120" y="680" class="small">The old worker deletes newCall.</text>
+
+  <rect x="800" y="555" width="712" height="150" rx="20" fill="#e6f5ec"/>
+  <text x="832" y="598" class="step green">SAFE: COMPARE CALL IDENTITY</text>
+  <text x="832" y="642" class="code">if g.calls[key] == call &#123; delete(...) &#125;</text>
+  <text x="832" y="680" class="small">Only a call removes its own generation.</text>
+
+  <rect x="88" y="724" width="1424" height="4" rx="2" fill="#d9e5df"/>
+</svg>

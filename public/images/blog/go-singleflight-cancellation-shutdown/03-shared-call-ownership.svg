@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="820" viewBox="0 0 1600 820" role="img" aria-labelledby="title desc">
+  <title id="title">A shared call owns the backend work while each caller owns only its wait</title>
+  <desc id="desc">Three callers wait independently on one group-owned call. Caller B cancels without canceling the shared context. The final waiter leaving or the loader closing cancels the shared backend worker.</desc>
+
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="7" stdDeviation="10" flood-color="#334455" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#087a51"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#d97857"/>
+    </marker>
+    <style>
+      .title { font: 700 50px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334455; }
+      .subtitle { font: 400 24px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #667788; }
+      .eyebrow { font: 700 24px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 1.4px; fill: #334455; }
+      .label { font: 700 28px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334455; }
+      .small { font: 600 24px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334455; }
+      .meta { font: 400 23px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #667788; }
+      .value { font: 700 34px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334455; }
+      .green { fill: #087a51; }
+      .red { fill: #d97857; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="820" fill="#f7f7f4"/>
+  <text x="64" y="70" class="title">The call owns the work; callers own their waits</text>
+  <text x="64" y="112" class="subtitle">One caller can leave without canceling work that other callers still need.</text>
+
+  <rect x="54" y="146" width="1492" height="624" rx="28" fill="#ffffff" filter="url(#shadow)"/>
+
+  <text x="92" y="195" class="eyebrow">INDEPENDENT WAITERS</text>
+  <text x="500" y="195" class="eyebrow">ONE SHARED CALL</text>
+  <text x="1100" y="195" class="eyebrow">GROUP-OWNED WORK</text>
+
+  <rect x="92" y="240" width="280" height="90" rx="18" fill="#e8f7ed" stroke="#5bcf80" stroke-width="3"/>
+  <text x="232" y="277" class="label" text-anchor="middle">Waiter A</text>
+  <text x="232" y="307" class="meta" text-anchor="middle">ctx still active</text>
+  <path d="M372 285 H470" fill="none" stroke="#087a51" stroke-width="6" marker-end="url(#arrow-green)"/>
+
+  <rect x="92" y="370" width="280" height="90" rx="18" fill="#fff2ed" stroke="#d97857" stroke-width="3"/>
+  <text x="232" y="407" class="label" text-anchor="middle">Waiter B</text>
+  <text x="232" y="437" class="meta" text-anchor="middle">ctx canceled → returns</text>
+  <path d="M372 415 H434" fill="none" stroke="#d97857" stroke-width="5" stroke-dasharray="12 10"/>
+  <circle cx="458" cy="415" r="21" fill="#d97857"/>
+  <path d="M448 405 L468 425 M468 405 L448 425" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
+
+  <rect x="92" y="500" width="280" height="90" rx="18" fill="#e8f7ed" stroke="#5bcf80" stroke-width="3"/>
+  <text x="232" y="537" class="label" text-anchor="middle">Waiter C</text>
+  <text x="232" y="567" class="meta" text-anchor="middle">ctx still active</text>
+  <path d="M372 545 H470" fill="none" stroke="#087a51" stroke-width="6" marker-end="url(#arrow-green)"/>
+
+  <rect x="500" y="220" width="500" height="425" rx="26" fill="#eefaf2" stroke="#5bcf80" stroke-width="4"/>
+  <text x="535" y="270" class="eyebrow">CALL: “HOMEPAGE”</text>
+
+  <rect x="535" y="300" width="430" height="82" rx="16" fill="#ffffff" stroke="#dce8e2" stroke-width="2"/>
+  <text x="562" y="350" class="label">waiters</text>
+  <text x="930" y="351" class="value" text-anchor="end">2</text>
+
+  <rect x="535" y="400" width="430" height="100" rx="16" fill="#ffffff" stroke="#dce8e2" stroke-width="2"/>
+  <text x="562" y="440" class="label">shared context</text>
+  <text x="930" y="440" class="small green" text-anchor="end">group-owned</text>
+  <text x="562" y="478" class="meta">B cannot cancel it</text>
+
+  <rect x="535" y="518" width="430" height="100" rx="16" fill="#ffffff" stroke="#dce8e2" stroke-width="2"/>
+  <text x="562" y="558" class="label">done</text>
+  <text x="930" y="558" class="small" text-anchor="end">open</text>
+  <text x="562" y="596" class="meta">closes once to publish the result</text>
+
+  <path d="M1000 325 H1070" fill="none" stroke="#087a51" stroke-width="6" marker-end="url(#arrow-green)"/>
+  <rect x="1100" y="250" width="380" height="130" rx="20" fill="#e8f7ed" stroke="#5bcf80" stroke-width="3"/>
+  <text x="1290" y="303" class="label" text-anchor="middle">go g.run(…)</text>
+  <text x="1290" y="343" class="meta" text-anchor="middle">fetch(call.ctx)</text>
+
+  <rect x="1100" y="420" width="380" height="198" rx="20" fill="#fffbea" stroke="#e2c84e" stroke-width="3"/>
+  <text x="1130" y="462" class="label">Cancellation rules</text>
+  <text x="1130" y="505" class="meta">one waiter leaves</text>
+  <text x="1450" y="505" class="small green" text-anchor="end">continue</text>
+  <text x="1130" y="548" class="meta">final waiter leaves</text>
+  <text x="1450" y="548" class="small red" text-anchor="end">cancel</text>
+  <text x="1130" y="591" class="meta">loader closes</text>
+  <text x="1450" y="591" class="small red" text-anchor="end">cancel</text>
+
+  <path d="M1100 540 C1040 540 1045 462 1008 452" fill="none" stroke="#d97857" stroke-width="4" stroke-dasharray="11 9" marker-end="url(#arrow-red)"/>
+
+  <rect x="92" y="675" width="1388" height="60" rx="16" fill="#e3f4e9"/>
+  <text x="786" y="714" class="small" text-anchor="middle">Caller cancellation changes interest; group cancellation changes the work.</text>
+</svg>
