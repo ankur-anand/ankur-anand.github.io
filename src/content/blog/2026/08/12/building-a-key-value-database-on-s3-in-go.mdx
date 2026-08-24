@@ -290,7 +290,7 @@ Last response wins, one commit disappears
 
 Instead, `CURRENT` is updated with a conditional write. The writer reads both the object and its provider version, builds the next state, and replaces it only if the version still matches.
 
-On S3 this is built from `If-Match` and `If-None-Match`. S3 compares the supplied ETag with the current object and rejects the write if the precondition no longer holds. [AWS documents both the](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) `[412 Precondition Failed](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)` [result and possible](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) `[409 Conflict](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)` [responses during concurrent conditional operations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html).
+On S3 this is built from `If-Match` and `If-None-Match`. S3 compares the supplied ETag with the current object and rejects the write if the precondition no longer holds. [AWS documents the `412 Precondition Failed` result and possible `409 Conflict` responses during concurrent conditional operations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html).
 
 <figure>
   <img src="/images/blog/building-a-key-value-database-on-s3-in-go/image-06-9e83ce00.png" alt="conditional CURRENT update" width="1600" height="900" loading="lazy" decoding="async" />

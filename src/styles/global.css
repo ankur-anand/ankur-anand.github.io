@@ -661,8 +661,14 @@ h3 {
 
 .article-prose {
   min-width: 0;
+  overflow-wrap: break-word;
   font-size: 1.04rem;
   line-height: 1.78;
+}
+
+.article-prose a,
+.article-prose :not(pre) > code {
+  overflow-wrap: anywhere;
 }
 
 .article-prose > :first-child {
