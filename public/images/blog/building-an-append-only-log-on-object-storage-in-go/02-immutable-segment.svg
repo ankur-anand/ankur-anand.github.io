@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">One immutable segment, built for range reads</title>
+  <desc id="desc">A segment has a file preamble, independently compressed blocks, a block index, and a fixed trailer. Readers range-read the trailer and index before fetching one selected block.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="7" stdDeviation="10" flood-color="#334455" flood-opacity="0.12"/></filter>
+    <marker id="arrow" markerWidth="18" markerHeight="18" refX="16" refY="9" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 18 9 0 18Z" fill="#087a51"/></marker>
+    <style>.title{font:700 49px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.subtitle{font:400 23px Inter,ui-sans-serif,system-ui,sans-serif;fill:#667788}.eye{font:700 19px Inter,ui-sans-serif,system-ui,sans-serif;letter-spacing:1.3px;fill:#334455}.label{font:700 25px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.meta{font:400 19px Inter,ui-sans-serif,system-ui,sans-serif;fill:#667788}.mono{font:600 17px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#334455}.small{font:600 18px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.white{fill:#fff}.pale{fill:#d9e2e7}</style>
+  </defs>
+  <rect width="1600" height="900" fill="#f7f7f4"/>
+  <text x="64" y="70" class="title">One immutable segment, built for range reads</text>
+  <text x="64" y="112" class="subtitle">The writer streams forward; the trailer and index let a reader jump backward into the object.</text>
+  <rect x="54" y="148" width="1492" height="690" rx="28" fill="#fff" filter="url(#shadow)"/>
+
+  <text x="88" y="202" class="eye">OBJECT BYTES</text>
+  <rect x="88" y="236" width="1424" height="240" rx="22" fill="#f5f8f7" stroke="#c8d2d7" stroke-width="3"/>
+  <rect x="110" y="260" width="154" height="192" rx="14" fill="#334455"/>
+  <text x="187" y="325" class="label white" text-anchor="middle">File</text><text x="187" y="358" class="label white" text-anchor="middle">preamble</text>
+  <text x="187" y="403" class="mono pale" text-anchor="middle">64 bytes</text>
+  <rect x="282" y="260" width="266" height="192" rx="14" fill="#e9f8ef" stroke="#5bcf80" stroke-width="3"/>
+  <text x="415" y="314" class="label" text-anchor="middle">Block 0</text>
+  <text x="415" y="352" class="mono" text-anchor="middle">preamble + zstd frame</text>
+  <text x="415" y="388" class="meta" text-anchor="middle">LSN · time · hash</text>
+  <text x="415" y="420" class="meta" text-anchor="middle">records</text>
+  <rect x="566" y="260" width="266" height="192" rx="14" fill="#e9f8ef" stroke="#5bcf80" stroke-width="3"/>
+  <text x="699" y="314" class="label" text-anchor="middle">Block 1</text>
+  <text x="699" y="352" class="mono" text-anchor="middle">preamble + zstd frame</text>
+  <text x="699" y="388" class="meta" text-anchor="middle">LSN · time · hash</text>
+  <text x="699" y="420" class="meta" text-anchor="middle">records</text>
+  <rect x="850" y="260" width="92" height="192" rx="14" fill="#eef3f5" stroke="#c8d2d7" stroke-width="3"/>
+  <text x="896" y="365" class="label" text-anchor="middle">…</text>
+  <rect x="960" y="260" width="296" height="192" rx="14" fill="#fff7e8" stroke="#e2c84e" stroke-width="3"/>
+  <text x="1108" y="314" class="label" text-anchor="middle">Block index</text>
+  <text x="1108" y="352" class="mono" text-anchor="middle">64 bytes per block</text>
+  <text x="1108" y="388" class="meta" text-anchor="middle">offset · LSN · timestamp</text>
+  <text x="1108" y="420" class="meta" text-anchor="middle">size · count · hash</text>
+  <rect x="1274" y="260" width="216" height="192" rx="14" fill="#fff2ed" stroke="#d97857" stroke-width="3"/>
+  <text x="1382" y="325" class="label" text-anchor="middle">Trailer</text>
+  <text x="1382" y="365" class="mono" text-anchor="middle">final 192 bytes</text>
+  <text x="1382" y="403" class="meta" text-anchor="middle">segment summary</text>
+
+  <text x="88" y="540" class="eye">RANDOM READ</text>
+  <rect x="88" y="570" width="306" height="150" rx="20" fill="#fff2ed" stroke="#d97857" stroke-width="3"/>
+  <circle cx="124" cy="608" r="21" fill="#d97857"/><text x="124" y="615" class="small white" text-anchor="middle">1</text>
+  <text x="157" y="615" class="label">Read trailer</text>
+  <text x="241" y="660" class="mono" text-anchor="middle">bytes[size-192:size]</text>
+  <text x="241" y="691" class="meta" text-anchor="middle">find index offset</text>
+  <path d="M394 645H444" fill="none" stroke="#087a51" stroke-width="5" marker-end="url(#arrow)"/>
+  <rect x="470" y="570" width="306" height="150" rx="20" fill="#fff7e8" stroke="#e2c84e" stroke-width="3"/>
+  <circle cx="506" cy="608" r="21" fill="#b99c15"/><text x="506" y="615" class="small white" text-anchor="middle">2</text>
+  <text x="539" y="615" class="label">Read index</text>
+  <text x="623" y="660" class="mono" text-anchor="middle">binary search ranges</text>
+  <text x="623" y="691" class="meta" text-anchor="middle">select block 1</text>
+  <path d="M776 645H826" fill="none" stroke="#087a51" stroke-width="5" marker-end="url(#arrow)"/>
+  <rect x="852" y="570" width="306" height="150" rx="20" fill="#e9f8ef" stroke="#5bcf80" stroke-width="3"/>
+  <circle cx="888" cy="608" r="21" fill="#087a51"/><text x="888" y="615" class="small white" text-anchor="middle">3</text>
+  <text x="921" y="615" class="label">Read one block</text>
+  <text x="1005" y="660" class="mono" text-anchor="middle">offset + stored size</text>
+  <text x="1005" y="691" class="meta" text-anchor="middle">verify · decompress</text>
+  <path d="M1158 645H1208" fill="none" stroke="#087a51" stroke-width="5" marker-end="url(#arrow)"/>
+  <rect x="1234" y="570" width="278" height="150" rx="20" fill="#334455"/>
+  <circle cx="1270" cy="608" r="21" fill="#fff"/><text x="1270" y="615" class="small" text-anchor="middle">4</text>
+  <text x="1303" y="615" class="label white">Decode records</text>
+  <text x="1373" y="660" class="mono pale" text-anchor="middle">LSN 8,250 → …</text>
+  <text x="1373" y="691" class="meta pale" text-anchor="middle">caller-owned bytes</text>
+
+  <rect x="88" y="760" width="1424" height="52" rx="14" fill="#dff3e7"/>
+  <text x="800" y="793" class="small" text-anchor="middle">Independent block compression makes a large remote object selectively readable.</text>
+</svg>

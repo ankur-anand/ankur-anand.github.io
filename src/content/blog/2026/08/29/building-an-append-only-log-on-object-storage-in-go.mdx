@@ -1,0 +1,696 @@
+---
+title: "The Bucket Is the Log: Building an Append-Only Log on Object Storage in Go"
+description: "How UnisonDB's object-store WAL replication became objlog: immutable segments, a bounded catalog, fencing, and replay by LSN or timestamp."
+publishedAt: 2026-08-29
+tags: ["Go", "Object storage", "Distributed systems", "Storage engines", "Append-only logs"]
+draft: false
+featured: false
+socialImage: "/images/blog/building-an-append-only-log-on-object-storage-in-go/social.png"
+socialImageAlt: "A Go writer publishing immutable log segments and a bounded catalog into an object storage bucket for direct replay by LSN or timestamp."
+legacyUrls: []
+---
+
+## This started as a UnisonDB replication problem
+
+While building [UnisonDB](https://github.com/ankur-anand/unisondb), I already had a useful replication path. The active HA writer produced one committed WAL, and connected replicas could consume that WAL over gRPC.
+
+gRPC was the right live path. A replica could stay connected, receive small batches quickly, and apply them in order. But I wanted the writer to publish the same committed WAL through object storage as well.
+
+The second path was not meant to replace gRPC. It had a different job:
+
+- publish the WAL once and let many replicas catch up without keeping a connection to the writer;
+- preserve replayable history after the writer process has gone away;
+- let a new replica start from an exact LSN or timestamp;
+- survive HA writer replacement without two writers extending the same sequence;
+- use the S3, GCS, Azure, or MinIO bucket we already operated, with no broker in between.
+
+```text
+                                      gRPC -> connected replica
+committed UnisonDB WAL -> one order --+
+                                      object storage -> catch-up and replay
+```
+
+<figure>
+  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/00-unisondb-dual-replication.svg" alt="A UnisonDB HA writer exposes one committed WAL through two replication paths: a live gRPC stream for connected replicas and immutable objlog segments in object storage for independently polling replicas, catch-up, and replay." width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>One committed WAL feeds two transports: gRPC for the live path, object storage for durable fan-out and replay.</figcaption>
+</figure>
+
+The first idea was to upload UnisonDB's existing WAL segment files. That looked like reuse. It was actually the wrong storage boundary.
+
+## The local WAL segment was the wrong remote format
+
+[UnisonDB's WAL](https://github.com/ankur-anand/unisondb/tree/main/pkg/walfs) is built for local disk. A segment is a preallocated memory-mapped file with a mutable 64-byte header followed by individually checksummed record frames:
+
+```text
++--------------------+----------------------+----------------------+-----+
+| mutable header     | record 0             | record 1             | ... |
+| write offset       | CRC + value + marker | CRC + value + marker |     |
++--------------------+----------------------+----------------------+-----+
+
+record offsets -> in-memory index -> separate local index file
+```
+
+That layout solves the local problems well. Appends are cheap, 8-byte-aligned frames work with the page cache, a trailer marker detects torn records, and recovery can scan until the first invalid frame.
+
+Uploading a sealed copy would preserve the bytes, but it would not create a useful remote log:
+
+| Local WAL assumption | Object-storage consequence |
+| --- | --- |
+| The header and write offset change while the segment is active | A completed object cannot be appended to or patched in place |
+| The file is preallocated for `mmap` | Uploading it can include capacity that contains no records |
+| Records are stored as raw individual frames | A reader must fetch the whole object or perform many tiny range requests |
+| Record offsets live in a sidecar index | The object is not independently searchable |
+| The format has no block-level LSN or timestamp summaries | Seeking remotely requires scanning records |
+| Local rollover determines when a file seals | Replication visibility becomes tied to the local WAL's segment size |
+
+The local format was not deficient. It was optimized for a different I/O boundary. A local WAL can mutate pages and keep sidecar state. A remote segment should be immutable, compressed, self-indexed, and useful through a small number of range reads.
+
+That required a new format.
+
+## Define `segformat` from the read path backward
+
+Before writing the object, I started with the read I wanted:
+
+```text
+seek to LSN 8,250
+  -> read a small fixed trailer
+  -> locate the embedded block index
+  -> find one compressed block
+  -> range-read and decode only that block
+```
+
+The resulting format is [`segformat` v2](https://github.com/ankur-anand/objlog/blob/main/internal/segformat/SPEC.md). One immutable object contains everything needed to validate and search it:
+
+```text
+file preamble
+block 0 preamble + compressed records
+block 1 preamble + compressed records
+...
+index preamble + block index
+fixed 192-byte trailer
+```
+
+<figure>
+  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/02-immutable-segment.svg" alt="An immutable objlog segformat object containing a file preamble, independently compressed record blocks, an embedded fixed-width block index, and a final trailer. A remote reader first range-reads the trailer and index, then only the selected block." width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>The format is written forward, but the trailer lets a remote reader enter it from the end.</figcaption>
+</figure>
+
+The layout buys us several properties at once.
+
+### The writer never backpatches the object
+
+The 64-byte file preamble contains only values known before streaming begins: version, partition, codec, base LSN, segment ID, and writer ID. Final sizes, counts, ranges, and hashes go into the trailer at the end.
+
+That matters for multipart upload. The writer can compress blocks and emit bytes forward without seeking back to rewrite the beginning.
+
+### Compression remains randomly readable
+
+With the default zstd codec, each block is one independent frame. A reader that needs one record downloads the selected block, not one compression stream spanning the complete segment.
+
+Every 64-byte block-index entry includes the block offset, stored and raw sizes, record count, base LSN, timestamp bounds, and hash. The same summary is also present in the block preamble, so the index and block can be checked against each other.
+
+### LSN and time are both search keys
+
+Records inside a block have non-decreasing timestamps and dense LSNs. The LSN does not need to be stored with every record:
+
+```text
+record LSN = block base LSN + record index
+```
+
+The index can therefore locate a block by LSN or by its maximum timestamp, then scan only inside that candidate block.
+
+### One object carries its index and integrity proof
+
+The block index sits inside the same object, immediately before the trailer. Block, index, and segment hashes detect corruption at the boundary where it is read. No local sidecar is required to interpret the remote bytes.
+
+### The bytes are not tied to the Go implementation
+
+All integer widths, byte order, limits, magic values, codecs, and validation rules are published. Checked-in binary fixtures pair encoded bytes with language-neutral expected values. A future reader does not have to reverse-engineer whichever Go structs happened to write the object.
+
+`segformat` solved the first problem: how to turn ordered WAL records into one immutable, compressed, range-readable object.
+
+It did not yet solve the log.
+
+## From a UnisonDB component to `objlog`
+
+A bucket full of valid segments still needs an order, a commit boundary, writer fencing, bounded metadata, checkpoints, and retention. None of those concerns were specific to UnisonDB records. The segment payload could just be bytes.
+
+The object-store replication layer therefore grew into a reusable storage protocol and later moved into its own repository as [`objlog`](https://github.com/ankur-anand/objlog).
+
+`objlog` is an embedded Go library for partitioned logs on S3-compatible storage, Google Cloud Storage, and Azure Blob Storage. A writer batches records into `segformat` objects. A small catalog publishes which objects belong to the committed log. Readers discover committed ranges through that catalog and read the selected blocks directly from the bucket.
+
+<figure>
+  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/01-the-bucket-is-the-log.svg" alt="A Go writer batches records into immutable segments, conditionally publishes a bounded catalog in an object storage bucket, and independent Go readers replay the committed log directly by LSN or timestamp." width="1600" height="860" loading="lazy" decoding="async" />
+  <figcaption>The extracted package knows about records, LSNs, segments, and catalogs—not UnisonDB's database model.</figcaption>
+</figure>
+
+This is not a smaller Kafka. It makes a different trade. Kafka provides live delivery, replicated brokers, and consumer-group coordination. `objlog` is for durable history that applications can reopen and replay from their own bucket.
+
+Let us run it before building the rest of the protocol.
+
+## Run the complete lifecycle
+
+The repository includes a demo backed by an in-process GCS emulator. It needs no cloud credentials and no Docker:
+
+```bash
+git clone https://github.com/ankur-anand/objlog.git
+cd objlog
+
+go run ./examples/demo -provider fake-gcs
+```
+
+The demo deliberately uses one record per segment so the objects are easy to count. A real writer batches many records into each segment.
+
+The shortened output shows the whole lifecycle:
+
+```text
+write       append 12 records, then flush 12 committed segments
+read        replay by LSN, seek by timestamp, fetch one exact LSN
+resume      persist a cursor checkpoint and continue without a gap
+tail        wait while another goroutine appends and flushes
+retention   advance oldestLSN; no object is deleted yet
+gc          delete unreachable objects after a grace period
+```
+
+The full demo ends with one useful fact:
+
+```text
+stored in   bucket objlog-demo and nowhere else — no broker, no local state
+```
+
+The emulator is only a provider. The same public API runs against MinIO, Azurite, and real cloud buckets.
+
+## A valid segment is not yet a log
+
+If the bucket contains ten valid segment objects, which ones belong to the committed sequence?
+
+Listing a prefix is not enough. A segment may have finished uploading just before its writer crashed. Another may belong to a writer that lost ownership. A third may have been prepared for a catalog update that never committed.
+
+Every record receives a log sequence number, or LSN, within one partition:
+
+```text
+partition 7
+
+LSN 40  -> order-created
+LSN 41  -> payment-authorized
+LSN 42  -> shipment-created
+```
+
+The LSNs are dense. If a segment begins at `40` and contains three records, its inclusive range is `[40, 42]`, and the next segment must begin at `43`.
+
+The writer maintains two different positions:
+
+```text
+optimistic next LSN -> next number assigned by the local writer
+committed next LSN  -> first number not yet visible in the catalog
+```
+
+Those positions may differ while a cut segment is being compressed, uploaded, or published.
+
+This is why `Append` and `Flush` have different contracts:
+
+```go
+appended, err := writer.Append(ctx, objlog.Record{
+	TimestampMS: time.Now().UnixMilli(),
+	Value:       []byte("payment-authorized"),
+})
+
+snapshot, err := writer.Flush(ctx)
+```
+
+`Append` assigns `appended.LSN` and accepts the record into writer-owned memory. It is not a durable acknowledgement. `Flush` cuts the active batch, waits for every earlier segment to be uploaded and published in order, and returns the committed head.
+
+That distinction is easy to miss:
+
+```text
+Append success -> this writer accepted the record
+Flush success  -> a reader can discover the record from the bucket
+```
+
+`Cut` sits between them. It rotates the active batch and lets background work begin, but it does not wait for catalog publication.
+
+The active batch is mutable only inside the writer process. Once cut, records move through compression and hashing workers, an ordered emitter restores block order, and a bounded multipart stream uploads the immutable segment. Compression may complete out of order; segment bytes may not.
+
+Now we need a publication boundary that says which uploaded segments belong to the log.
+
+## Uploading a segment does not commit it
+
+Now we can produce a durable object. We still must decide whether it belongs to the log.
+
+`objlog` uses a data-first, metadata-second protocol:
+
+```text
+1. seal and upload the immutable segment
+2. prepare any immutable catalog pages
+3. replace the partition head with compare-and-swap
+```
+
+Only step 3 changes reader visibility.
+
+In simplified pseudocode:
+
+```go
+segment := upload(batch)
+nextHead := appendSegment(currentHead, segment)
+
+if !compareAndSwap("head.plc", currentToken, nextHead) {
+	return ErrStaleWriter
+}
+```
+
+<figure>
+  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/03-publish-is-the-commit.svg" alt="A three-step publication protocol: upload an immutable segment, write any immutable catalog pages, then compare-and-swap head.plc. Readers continue seeing the old head until the final conditional write succeeds." width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>Objects written before the head CAS are durable candidates. The CAS decides reachability.</figcaption>
+</figure>
+
+This ordering turns several failures into understandable states:
+
+| Failure point | Reader-visible result |
+| --- | --- |
+| Before segment completion | No committed segment |
+| After segment upload, before head publication | Durable but unreachable orphan |
+| After catalog page upload, before head publication | Durable but unreachable page |
+| Head compare-and-swap loses | Old committed log remains authoritative |
+| Head compare-and-swap succeeds | Segment and referenced pages become visible together |
+
+The protocol does not need a multi-object transaction. Immutable objects can arrive early because readers reach them only through one conditionally replaced head.
+
+S3 implements the head update with `If-Match` against the ETag previously loaded; creation uses `If-None-Match: *`. GCS uses generation preconditions, and Azure Blob uses ETag conditions. The token differs, but the required operation is the same:
+
+> Replace this object only if it is still the version I read.
+
+The provider behavior is documented in the official guides for [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html), [GCS generation preconditions](https://cloud.google.com/storage/docs/request-preconditions), and [Azure Blob optimistic concurrency](https://learn.microsoft.com/azure/storage/blobs/concurrency-manage).
+
+## Fence the writer through the same head
+
+Compare-and-swap also gives us writer fencing.
+
+When a writer opens partition 7, it does not acquire a process-local mutex. It loads the catalog head, increments the writer epoch, installs a new writer ID, and conditionally replaces the head.
+
+Suppose writer A owns epoch 4:
+
+```text
+head: epoch=4 writer=A nextLSN=100
+```
+
+Writer B takes over and publishes:
+
+```text
+head: epoch=5 writer=B nextLSN=100
+```
+
+A may still be alive. It may even finish uploading a segment that begins at LSN 100. But its segment carries epoch 4 and writer A's identity. It cannot publish behind a head owned by epoch 5.
+
+```text
+writer A segment -> epoch 4 -> rejected
+writer B segment -> epoch 5 -> eligible to publish
+```
+
+The object-store condition prevents A from replacing the newer head, while the epoch and writer ID prevent an accidentally replayed request from being accepted as B's work.
+
+<figure>
+  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/04-writer-fencing.svg" alt="Writer A owns epoch 4, then Writer B conditionally advances the catalog to epoch 5. A late segment from Writer A may exist as an orphan, but its epoch and writer ID do not match the head and publication is rejected." width="1600" height="860" loading="lazy" decoding="async" />
+  <figcaption>A stale writer can waste an upload. It cannot extend the committed sequence.</figcaption>
+</figure>
+
+There is an important limit hidden here. `objlog` does not run leader election or decide when a writer is dead. The application decides when to open a replacement writer. The catalog only makes that takeover safe.
+
+Ordering is per partition. If more write throughput is needed, use more partitions and choose the partition in the application. There is no cross-partition total order or transaction.
+
+## Why not keep every segment in one manifest?
+
+After publication, a reader needs to map an LSN to a segment. The first catalog design could be one JSON document:
+
+```json
+{
+  "segments": [
+    {"base_lsn": 0, "last_lsn": 4095, "key": "..."},
+    {"base_lsn": 4096, "last_lsn": 8191, "key": "..."}
+  ]
+}
+```
+
+It works until history becomes large. Every append must download, decode, extend, encode, and upload metadata proportional to the lifetime segment count. Readers must load the same history even when they want one recent record.
+
+`objlog` keeps the mutable catalog head bounded by paging completed history into immutable objects.
+
+With the default fan-out of 128:
+
+1. The head keeps fewer than 128 open segment entries.
+2. When that leaf fills, it becomes an immutable leaf page.
+3. The head keeps fewer than 128 references to completed leaf pages.
+4. When that level fills, it becomes an immutable index page and one reference moves up.
+5. The carry continues through higher levels.
+
+This behaves like a base-128 counter whose digits are the unfinished right edge of a tree.
+
+<figure>
+  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/05-bounded-catalog.svg" alt="A bounded catalog head contains current leaf entries and the open frontier of an immutable page tree. When 128 leaf entries fill, they become a leaf page; when 128 leaf references fill, they become an index page and one reference is carried upward." width="1600" height="940" loading="lazy" decoding="async" />
+  <figcaption>History grows in immutable pages. Only the incomplete frontier remains in the mutable head.</figcaption>
+</figure>
+
+One segment publish may seal a leaf and cascade through several index levels. Those page objects are written first. One CAS of `head.plc` then commits the new segment and every new page reference together.
+
+The head still contains the hot partition state:
+
+```text
+next_lsn
+oldest_lsn
+writer_epoch and writer_id
+generation
+lifetime and reachable segment counts
+last segment summary
+open catalog frontier
+```
+
+It does not grow linearly with the partition's history.
+
+The catalog is also ordered by timestamp bounds. LSN ranges are contiguous, and segment timestamp ranges must be non-decreasing. The writer rejects a timestamp regression. That invariant lets the same tree answer two kinds of lookup.
+
+The exact page and head encoding is specified in [`catformat` v1](https://github.com/ankur-anand/objlog/blob/main/internal/catalog/blob/SPEC.md).
+
+## Replay is a two-stage range read
+
+Suppose a reader asks for LSN 8,250.
+
+The reader performs two searches:
+
+```text
+catalog search -> find the segment containing 8,250
+segment search -> find the block containing 8,250
+```
+
+At the catalog level, it loads `head.plc`, selects the root range containing the LSN, and descends immutable index pages until it reaches a segment reference.
+
+At the segment level, it range-reads the final trailer, reads the block index, binary-searches the index, and fetches only the selected block range. It does not download every segment before the target, and it does not need the writer process.
+
+Timestamp replay follows the same shape:
+
+```text
+catalog page max timestamps -> candidate segment
+segment block max timestamps -> candidate block
+records inside block         -> first timestamp >= target
+```
+
+<figure>
+  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/06-replay-by-lsn-or-time.svg" alt="Replay by LSN or timestamp first descends the bounded catalog to one segment, then reads the segment trailer and index to select one compressed block, and finally decodes records from that block." width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>The catalog narrows history to one object; the segment index narrows that object to one block.</figcaption>
+</figure>
+
+The format specification gives a useful scale example. At the default fan-out of 128, a partition with ten million segments needs at most four catalog GETs for a lookup: the head, a level-2 page, a level-1 page, and a leaf page. The record bytes then come from segment range reads.
+
+## Reading from Go
+
+First create a provider store. This example uses S3, but the GCS and Azure packages expose the same `objlog.Store` boundary:
+
+```go
+store, err := objs3.New(objs3.Options{
+	Client:   s3Client,
+	Bucket:   "events",
+	Prefix:   "prod",
+	StreamID: "orders",
+})
+if err != nil {
+	return err
+}
+
+log, err := objlog.Open(objlog.Options{Store: store})
+if err != nil {
+	return err
+}
+defer log.Close()
+```
+
+Open one fenced writer for a partition:
+
+```go
+writer, err := log.OpenWriter(ctx, objlog.WriterOptions{
+	Partition: 7,
+	WriterID:  uuid.New(),
+	Batch: objlog.BatchPolicy{
+		MaxDelay:   time.Second,
+		MaxBytes:   64 << 20,
+		MaxRecords: 16_384,
+	},
+})
+if err != nil {
+	return err
+}
+defer writer.Abort(context.Background())
+```
+
+The first configured batch limit wins. `MaxBytes` is measured before compression. `MaxDelay` begins when the first record enters a non-empty batch. If cut segments accumulate faster than the bucket and catalog can publish them, `BackpressurePolicy` bounds the pending batches and bytes rather than allowing memory to grow without limit.
+
+Replay a committed range:
+
+```go
+partition := log.Reader().Partition(7)
+
+batch, err := partition.Read(ctx, objlog.ReadRequest{
+	StartLSN:  8_250,
+	Limit:     1_000,
+	Freshness: objlog.FreshnessOnTail,
+})
+if err != nil {
+	return err
+}
+
+for _, record := range batch.Records {
+	fmt.Printf("%d %s\n", record.LSN, record.Value)
+}
+```
+
+`Read` is passive. It returns committed data and never waits for future records.
+
+The freshness setting controls catalog reloads:
+
+```text
+FreshnessCached  -> use a cached head when one exists
+FreshnessOnTail  -> refresh when the request reaches the cached tail
+FreshnessLatest  -> refresh before the read
+```
+
+The default is `FreshnessOnTail`, which lets replay move through known history without reloading the head for every batch.
+
+## A cursor is not a broker-side consumer offset
+
+A cursor is a local position over the shared reader runtime:
+
+```go
+cursor, err := partition.Cursor(objlog.CursorOptions{
+	StartLSN: 0,
+	Limit:    1_000,
+})
+if err != nil {
+	return err
+}
+defer cursor.Close()
+
+batch, err := cursor.Next(ctx)
+checkpoint, err := cursor.Checkpoint(ctx)
+```
+
+The checkpoint is deliberately more than one integer:
+
+```json
+{
+  "version": 1,
+  "stream_id": "orders",
+  "partition": 7,
+  "next_lsn": 1000
+}
+```
+
+Persist the complete value in application-owned storage after processing the batch. On resume, `objlog` validates the stream, partition, current tail, and retention floor. A checkpoint from another stream is rejected. A checkpoint below `oldest_lsn` returns an expiration error instead of silently jumping forward.
+
+`objlog` does not maintain consumer groups or commit offsets on behalf of applications. Two consumers may keep checkpoints in PostgreSQL, another object, a workflow engine, or anywhere else that fits their processing contract.
+
+## Tailing is explicit polling with a blocking API
+
+There is no broker connection waiting to push the next event. Following the live tail means refreshing the catalog head.
+
+The library makes that work explicit through a `Watch`:
+
+```go
+watch, err := log.Reader().Watch(ctx, objlog.WatchOptions{
+	Partitions: []uint32{7},
+})
+if err != nil {
+	return err
+}
+defer watch.Close()
+
+tailer, err := watch.Tail(objlog.TailOptions{
+	Partition: 7,
+	StartLSN:  batch.NextLSN,
+	Limit:     1_000,
+})
+if err != nil {
+	return err
+}
+defer tailer.Close()
+
+next, err := tailer.Next(ctx)
+```
+
+`Tailer.Next` returns immediately when committed records are available. At the tail it blocks until the watch observes a newer head or the context is canceled.
+
+The watch polls selected partitions on a configurable interval and bounds concurrent refreshes. Passive readers start no background loop. That distinction prevents a reader created for an occasional historical query from becoming an accidental permanent polling service.
+
+## Accepted work belongs to the writer
+
+The background publication pipeline creates a cancellation question similar to any shared asynchronous component.
+
+Suppose a caller invokes `Flush(ctx)` and its deadline expires while a segment upload is already underway. Should canceling that caller abandon records previously accepted by `Append`?
+
+It should not.
+
+The caller's context bounds the caller's wait. Accepted records belong to the writer's component context. Segment finalization and catalog publication continue until they succeed, reach configured operation timeouts, or the writer enters terminal shutdown.
+
+```text
+request context -> may stop waiting for Flush
+writer context  -> owns accepted segment work
+```
+
+If a graceful `Close` times out, a later `Close` can join the same drain. `Abort` makes the writer terminal, cancels component-owned work, cleans up what it can, and also lets later callers join the existing drain rather than starting a second shutdown race.
+
+The pipeline also preserves publication order. Detached segments may finish compression and upload out of order, but one publish worker advances the catalog in cut order. The next segment cannot be committed before the segment whose LSN range precedes it.
+
+These details are documented in the repository's [writer design](https://github.com/ankur-anand/objlog/blob/main/internal/writer/DESIGN.md).
+
+## Retention changes reachability before it deletes bytes
+
+Deleting old history is another multi-object operation, so it uses the same separation between visibility and physical objects.
+
+Retention has three explicit stages:
+
+```text
+request intent -> fenced catalog update -> delayed physical deletion
+```
+
+First, any process records a monotonic request:
+
+```go
+_, err := log.RequestRetention(ctx, objlog.RetentionRequest{
+	Partition:     7,
+	PolicyVersion: 42,
+	BeforeLSN:     1_000_000,
+})
+```
+
+This does not change what readers see.
+
+Second, the active writer applies the latest request through its existing fence:
+
+```go
+result, err := writer.ApplyRetention(ctx)
+```
+
+The head advances `oldest_lsn` and drops catalog references below the effective boundary. Segments are immutable, so a boundary that lands inside a segment retains that complete segment. The effective `oldest_lsn` may therefore be lower than the requested LSN.
+
+Finally, a separately scheduled reclaimer waits through a grace period and deletes objects that are no longer reachable. A slower scrub also finds uploads and catalog pages that were never committed because a writer crashed or lost its fence.
+
+<figure>
+  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/07-retention-and-gc.svg" alt="Retention proceeds in three stages: a maintenance request records intent, the active fenced writer publishes a new head that drops whole-segment references, and a separately scheduled reclaimer deletes unreachable objects after a grace period while scrub finds never-published orphans." width="1600" height="880" loading="lazy" decoding="async" />
+  <figcaption>Logical expiry is immediate at head publication. Physical reclamation is deliberately later.</figcaption>
+</figure>
+
+The order protects readers that already discovered an old segment:
+
+```text
+new reads stop discovering it
+existing reads get a grace period
+only then may GC delete it
+```
+
+Nothing schedules retention or GC implicitly. Partition discovery, cadence, and maintenance ownership remain application decisions.
+
+## A published format is part of the API
+
+The Go library is one implementation of the log. The bytes in the bucket are the durable interface.
+
+`objlog` publishes two specifications:
+
+| Format | Contains |
+| --- | --- |
+| [`segformat` v2](https://github.com/ankur-anand/objlog/blob/main/internal/segformat/SPEC.md) | Segment preambles, blocks, records, index, and trailer |
+| [`catformat` v1](https://github.com/ankur-anand/objlog/blob/main/internal/catalog/blob/SPEC.md) | Mutable head, immutable leaf pages, and immutable index pages |
+
+Both formats use fixed-width metadata, explicit versions, bounded counts, integrity hashes, and checked-in binary fixtures with language-neutral expected values. An unknown version is rejected instead of guessed.
+
+That matters even if every current reader is written in Go. A durable format should survive a refactor, a second implementation, and the process that originally wrote it. A Rust, Java, Python, or C++ reader can derive object keys, validate the catalog, range-read a segment, and decode records without calling a Go service.
+
+## What “no broker” gives us—and what it does not
+
+Removing a broker removes a category of operation:
+
+```text
+no broker cluster
+no broker replication configuration
+no broker-local copy of the durable history
+no reader-to-writer connection
+no partition process kept alive while the stream is idle
+```
+
+It does not remove distributed-systems costs. The object store is remote. Conditional writes have latency and request cost. Tailing observes catalog refreshes rather than receiving an immediate broker push. A single partition has one fenced writer, and applications own producer retry semantics and consumer checkpoints.
+
+`objlog` fits when the primary need is durable history:
+
+- audit and compliance streams that must remain in an owned bucket;
+- replay and reprocessing by LSN or time;
+- sparse or intermittently active partitions;
+- independent readers that should not require a running writer;
+- pipelines where object-store latency and batched visibility are acceptable.
+
+Use a broker when the primary need is live messaging:
+
+- low-latency delivery to connected consumers;
+- consumer groups and automatic partition assignment;
+- broker-managed acknowledgements and offsets;
+- high-frequency small writes that must become visible immediately;
+- an established streaming ecosystem and protocol.
+
+Kafka, for example, provides replicated brokers and coordinates partition ownership across consumers in a group. Those are valuable features, not accidental overhead. The [Kafka documentation](https://kafka.apache.org/documentation/) describes that live event-streaming model directly.
+
+The two systems can also compose: publish to a broker for live delivery and keep replayable long-term history in object storage.
+
+## The catalog head is the commit record
+
+We began with what looked like one upload:
+
+```text
+append -> object storage
+```
+
+The complete protocol is richer:
+
+```text
+append
+  -> assign dense per-partition LSN
+  -> batch records
+  -> seal independently readable blocks
+  -> upload an immutable segment
+  -> write any immutable catalog pages
+  -> conditionally publish one bounded head
+  -> let readers replay directly from the bucket
+```
+
+The immutable objects carry the history. The catalog gives that history an order and a visibility boundary. The fence says who may extend it. Range indexes make it practical to reopen. Retention removes references first and bytes later.
+
+Back in UnisonDB, this gives the WAL two deliberate paths. gRPC remains the low-latency stream for connected replicas. The object-store path publishes the same order once so replicas can poll, catch up, or recover directly from durable history. The [MinIO replication example](https://github.com/ankur-anand/unisondb/tree/main/cmd/examples/blobstore-minio) exercises both the standalone writer and HA failover cases.
+
+That is the central idea behind `objlog`:
+
+> The segment upload stores bytes. The catalog head commits the log.
+
+Once that boundary is explicit, object storage stops looking like an inconvenient filesystem and starts looking like the durability layer the log was designed for.
+
+The complete implementation, format specifications, compatibility corpus, provider integrations, tests, and runnable demo are available in [`ankur-anand/objlog`](https://github.com/ankur-anand/objlog).
+
+## References
+
+- [UnisonDB](https://github.com/ankur-anand/unisondb) is where the object-store WAL replication requirement began; its [blob-store replication example](https://github.com/ankur-anand/unisondb/tree/main/cmd/examples/blobstore-minio) shows producers and replicas using MinIO.
+- [`objlog`](https://github.com/ankur-anand/objlog) contains the complete implementation, local emulator demo, format corpora, fuzz targets, provider tests, and race tests.
+- The [usage guide](https://github.com/ankur-anand/objlog/blob/main/docs/usage.md) covers writer, reader, cursor, tailing, retention, lifecycle, and metrics APIs.
+- The [segment writer design](https://github.com/ankur-anand/objlog/blob/main/internal/segwriter/DESIGN.md) explains the streaming compression and multipart upload pipeline.
+- The [catalog format](https://github.com/ankur-anand/objlog/blob/main/internal/catalog/blob/SPEC.md) defines conditional publication, fencing, bounded pages, lookup, and copy-on-write retention.

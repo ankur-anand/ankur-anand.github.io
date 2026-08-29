@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Publication is the commit point</title>
+  <desc id="desc">The writer uploads a segment, writes any immutable catalog pages, then conditionally replaces head.plc. Readers see the previous committed state until the compare-and-swap succeeds.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="7" stdDeviation="10" flood-color="#334455" flood-opacity="0.12"/></filter>
+    <marker id="arrow" markerWidth="18" markerHeight="18" refX="16" refY="9" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 18 9 0 18Z" fill="#087a51"/></marker>
+    <style>.title{font:700 49px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.subtitle{font:400 23px Inter,ui-sans-serif,system-ui,sans-serif;fill:#667788}.eye{font:700 19px Inter,ui-sans-serif,system-ui,sans-serif;letter-spacing:1.3px;fill:#334455}.label{font:700 26px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.meta{font:400 19px Inter,ui-sans-serif,system-ui,sans-serif;fill:#667788}.mono{font:600 18px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#334455}.small{font:600 19px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.white{fill:#fff}.pale{fill:#d9e2e7}</style>
+  </defs>
+  <rect width="1600" height="900" fill="#f7f7f4"/>
+  <text x="64" y="70" class="title">Publication—not upload—is the commit point</text>
+  <text x="64" y="112" class="subtitle">Data and pages may arrive early; only one conditional head replacement changes reachability.</text>
+  <rect x="54" y="148" width="1492" height="690" rx="28" fill="#fff" filter="url(#shadow)"/>
+
+  <text x="84" y="198" class="eye">WRITER PROTOCOL</text>
+  <line x1="172" y1="252" x2="1422" y2="252" stroke="#d7e0e3" stroke-width="5"/>
+  <circle cx="220" cy="252" r="29" fill="#334455"/><text x="220" y="260" class="small white" text-anchor="middle">1</text>
+  <circle cx="800" cy="252" r="29" fill="#334455"/><text x="800" y="260" class="small white" text-anchor="middle">2</text>
+  <circle cx="1380" cy="252" r="29" fill="#087a51"/><text x="1380" y="260" class="small white" text-anchor="middle">3</text>
+
+  <rect x="84" y="306" width="380" height="220" rx="22" fill="#fff7e8" stroke="#e2c84e" stroke-width="3"/>
+  <text x="274" y="357" class="label" text-anchor="middle">Upload segment</text>
+  <rect x="139" y="389" width="270" height="70" rx="13" fill="#fff" stroke="#e2c84e" stroke-width="2"/>
+  <text x="274" y="419" class="mono" text-anchor="middle">seg-000...8250.plseg</text>
+  <text x="274" y="447" class="meta" text-anchor="middle">immutable object</text>
+  <text x="274" y="493" class="meta" text-anchor="middle">durable, not discoverable</text>
+  <path d="M464 416H582" fill="none" stroke="#087a51" stroke-width="5" marker-end="url(#arrow)"/>
+
+  <rect x="608" y="306" width="384" height="220" rx="22" fill="#eef3f5" stroke="#c8d2d7" stroke-width="3"/>
+  <text x="800" y="357" class="label" text-anchor="middle">Write full pages</text>
+  <rect x="666" y="389" width="268" height="70" rx="13" fill="#fff" stroke="#c8d2d7" stroke-width="2"/>
+  <text x="800" y="419" class="mono" text-anchor="middle">leaf-...plc · index-...plc</text>
+  <text x="800" y="447" class="meta" text-anchor="middle">immutable objects</text>
+  <text x="800" y="493" class="meta" text-anchor="middle">durable, still unreachable</text>
+  <path d="M992 416H1110" fill="none" stroke="#087a51" stroke-width="5" marker-end="url(#arrow)"/>
+
+  <rect x="1136" y="306" width="376" height="220" rx="22" fill="#e9f8ef" stroke="#5bcf80" stroke-width="3"/>
+  <text x="1324" y="357" class="label" text-anchor="middle">Compare-and-swap head</text>
+  <rect x="1190" y="389" width="268" height="70" rx="13" fill="#334455"/>
+  <text x="1324" y="419" class="mono pale" text-anchor="middle">head.plc</text>
+  <text x="1324" y="447" class="meta pale" text-anchor="middle">expected token must match</text>
+  <text x="1324" y="493" class="meta" text-anchor="middle">the visibility boundary</text>
+
+  <text x="84" y="590" class="eye">WHAT READERS SEE</text>
+  <rect x="84" y="620" width="620" height="134" rx="20" fill="#fff2ed" stroke="#d97857" stroke-width="3"/>
+  <text x="118" y="663" class="label">Before CAS</text>
+  <text x="118" y="704" class="mono">head.next_lsn = 8,250</text>
+  <text x="118" y="734" class="meta">new segment and pages have no reachable path</text>
+  <path d="M704 687H850" fill="none" stroke="#087a51" stroke-width="6" marker-end="url(#arrow)"/>
+  <rect x="876" y="620" width="636" height="134" rx="20" fill="#e9f8ef" stroke="#5bcf80" stroke-width="3"/>
+  <text x="910" y="663" class="label">After successful CAS</text>
+  <text x="910" y="704" class="mono">head.next_lsn = 12,346</text>
+  <text x="910" y="734" class="meta">one head makes every referenced immutable object visible</text>
+
+  <rect x="84" y="780" width="1428" height="34" rx="10" fill="#dff3e7"/>
+  <text x="798" y="805" class="small" text-anchor="middle">A crash before the final CAS creates cleanup work—not a partial committed log.</text>
+</svg>
