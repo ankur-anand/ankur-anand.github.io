@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
   <title id="title">One committed UnisonDB WAL feeds two replication paths</title>
-  <desc id="desc">The active UnisonDB HA writer exposes committed WAL records through a live gRPC stream for connected replicas and an objlog publisher that seals immutable segments into object storage for polling replicas, catch-up, and replay.</desc>
+  <desc id="desc">The active UnisonDB HA writer exposes the same committed WAL through two replica transports: a direct gRPC stream and immutable segments in object storage that a replica can poll without connecting to the writer.</desc>
   <defs>
     <filter id="shadow" x="-10%" y="-10%" width="120%" height="135%">
       <feDropShadow dx="0" dy="8" stdDeviation="11" flood-color="#334455" flood-opacity="0.12"/>
@@ -25,7 +25,7 @@
 
   <rect width="1600" height="900" fill="#f7f7f4"/>
   <text x="64" y="70" class="title">One committed WAL, two replication paths</text>
-  <text x="64" y="112" class="subtitle">gRPC serves connected replicas now; object storage preserves independently replayable history.</text>
+  <text x="64" y="112" class="subtitle">Replicas either stay connected over gRPC or poll the same committed WAL from object storage.</text>
   <rect x="54" y="148" width="1492" height="686" rx="28" fill="#fff" filter="url(#shadow)"/>
 
   <text x="84" y="198" class="eye">SOURCE OF ORDER</text>
@@ -41,7 +41,7 @@
   <text x="261" y="620" class="small" text-anchor="middle">one order · one commit point</text>
   <text x="261" y="651" class="meta" text-anchor="middle">both paths copy committed records</text>
 
-  <text x="546" y="198" class="eye">LIVE PATH</text>
+  <text x="546" y="198" class="eye">DIRECT gRPC PATH</text>
   <path d="M438 356H500V306H546" fill="none" stroke="#334455" stroke-width="5" marker-end="url(#arrowNavy)"/>
   <rect x="546" y="228" width="344" height="194" rx="22" fill="#eef3f5" stroke="#9baaba" stroke-width="3"/>
   <text x="718" y="282" class="label" text-anchor="middle">gRPC streamer</text>
@@ -50,41 +50,38 @@
   <text x="718" y="395" class="meta" text-anchor="middle">low-latency · connected</text>
   <path d="M890 325H1016" fill="none" stroke="#334455" stroke-width="5" marker-end="url(#arrowNavy)"/>
   <rect x="1016" y="228" width="470" height="194" rx="22" fill="#eef3f5" stroke="#9baaba" stroke-width="3"/>
-  <text x="1251" y="282" class="label" text-anchor="middle">Connected replica</text>
+  <text x="1251" y="282" class="label" text-anchor="middle">gRPC-connected replica</text>
   <text x="1251" y="327" class="mono" text-anchor="middle">receive → validate → apply</text>
-  <text x="1251" y="370" class="meta" text-anchor="middle">the writer is part of the live path</text>
+  <text x="1251" y="370" class="meta" text-anchor="middle">maintains a direct connection to the writer</text>
 
-  <text x="546" y="478" class="eye">DURABLE FAN-OUT PATH</text>
+  <text x="546" y="478" class="eye">OBJECT-STORAGE PATH</text>
   <path d="M438 540H500V590H546" fill="none" stroke="#087a51" stroke-width="5" marker-end="url(#arrowGreen)"/>
   <rect x="546" y="506" width="344" height="208" rx="22" fill="#e9f8ef" stroke="#4fcf7d" stroke-width="3"/>
   <text x="718" y="560" class="label" text-anchor="middle">objlog publisher</text>
   <rect x="590" y="586" width="256" height="58" rx="12" fill="#fff" stroke="#4fcf7d" stroke-width="2"/>
   <text x="718" y="622" class="mono" text-anchor="middle">batch · seal · publish</text>
   <text x="718" y="685" class="meta" text-anchor="middle">immutable · independently replayable</text>
-  <path d="M890 610H980" fill="none" stroke="#087a51" stroke-width="5" marker-end="url(#arrowGreen)"/>
+  <path d="M890 610H920" fill="none" stroke="#087a51" stroke-width="5" marker-end="url(#arrowGreen)"/>
 
-  <rect x="980" y="500" width="282" height="222" rx="24" fill="#eef3f5" stroke="#9fcdb3" stroke-width="3"/>
-  <ellipse cx="1121" cy="542" rx="112" ry="28" fill="#fff" stroke="#78899c" stroke-width="3"/>
-  <path d="M1009 542V661C1009 677 1059 690 1121 690S1233 677 1233 661V542" fill="none" stroke="#78899c" stroke-width="3"/>
-  <text x="1121" y="550" class="small" text-anchor="middle">object storage</text>
-  <rect x="1035" y="580" width="172" height="44" rx="10" fill="#334455"/>
-  <text x="1121" y="609" class="mono white" text-anchor="middle">bounded catalog</text>
-  <rect x="1035" y="638" width="50" height="28" rx="7" fill="#fff7e8" stroke="#e2c84e" stroke-width="2"/>
-  <rect x="1096" y="638" width="50" height="28" rx="7" fill="#fff7e8" stroke="#e2c84e" stroke-width="2"/>
-  <rect x="1157" y="638" width="50" height="28" rx="7" fill="#fff7e8" stroke="#e2c84e" stroke-width="2"/>
+  <rect x="920" y="500" width="220" height="222" rx="24" fill="#eef3f5" stroke="#9fcdb3" stroke-width="3"/>
+  <ellipse cx="1030" cy="542" rx="84" ry="28" fill="#fff" stroke="#78899c" stroke-width="3"/>
+  <path d="M946 542V661C946 677 984 690 1030 690S1114 677 1114 661V542" fill="none" stroke="#78899c" stroke-width="3"/>
+  <text x="1030" y="550" class="small" text-anchor="middle">object storage</text>
+  <rect x="957" y="580" width="146" height="44" rx="10" fill="#334455"/>
+  <text x="1030" y="609" class="small white" text-anchor="middle">bounded catalog</text>
+  <rect x="957" y="638" width="42" height="28" rx="7" fill="#fff7e8" stroke="#e2c84e" stroke-width="2"/>
+  <rect x="1009" y="638" width="42" height="28" rx="7" fill="#fff7e8" stroke="#e2c84e" stroke-width="2"/>
+  <rect x="1061" y="638" width="42" height="28" rx="7" fill="#fff7e8" stroke="#e2c84e" stroke-width="2"/>
 
-  <path d="M1262 610H1290" fill="none" stroke="#087a51" stroke-width="5"/>
-  <path d="M1290 533V687" fill="none" stroke="#087a51" stroke-width="4"/>
-  <path d="M1290 533H1320" fill="none" stroke="#087a51" stroke-width="4" marker-end="url(#arrowGreen)"/>
-  <path d="M1290 610H1320" fill="none" stroke="#087a51" stroke-width="4" marker-end="url(#arrowGreen)"/>
-  <path d="M1290 687H1320" fill="none" stroke="#087a51" stroke-width="4" marker-end="url(#arrowGreen)"/>
-  <rect x="1320" y="500" width="166" height="66" rx="14" fill="#e9f8ef" stroke="#4fcf7d" stroke-width="2"/>
-  <text x="1403" y="541" class="small" text-anchor="middle">catch up</text>
-  <rect x="1320" y="577" width="166" height="66" rx="14" fill="#e9f8ef" stroke="#4fcf7d" stroke-width="2"/>
-  <text x="1403" y="618" class="small" text-anchor="middle">replay</text>
-  <rect x="1320" y="654" width="166" height="66" rx="14" fill="#e9f8ef" stroke="#4fcf7d" stroke-width="2"/>
-  <text x="1403" y="695" class="small" text-anchor="middle">poll tail</text>
+  <path d="M1140 610H1210" fill="none" stroke="#087a51" stroke-width="5" marker-end="url(#arrowGreen)"/>
+  <rect x="1210" y="500" width="276" height="222" rx="24" fill="#e9f8ef" stroke="#4fcf7d" stroke-width="3"/>
+  <text x="1348" y="550" class="label" text-anchor="middle">Object-store replica</text>
+  <rect x="1240" y="570" width="216" height="100" rx="13" fill="#fff" stroke="#4fcf7d" stroke-width="2"/>
+  <text x="1348" y="598" class="mono" text-anchor="middle">poll catalog</text>
+  <text x="1348" y="628" class="mono" text-anchor="middle">fetch ranges</text>
+  <text x="1348" y="658" class="mono" text-anchor="middle">validate → apply</text>
+  <text x="1348" y="700" class="meta" text-anchor="middle">catch up · replay · tail</text>
 
   <rect x="84" y="762" width="1402" height="44" rx="12" fill="#dff3e7"/>
-  <text x="785" y="791" class="small" text-anchor="middle">The second path removes the writer from replay—not from the production of the committed order.</text>
+  <text x="785" y="791" class="small" text-anchor="middle">Both replicas apply the same committed order; the object-store replica never connects to the writer.</text>
 </svg>

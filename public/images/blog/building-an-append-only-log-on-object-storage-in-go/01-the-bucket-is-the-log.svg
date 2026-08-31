@@ -5,12 +5,12 @@
     <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="7" stdDeviation="10" flood-color="#334455" flood-opacity="0.12"/></filter>
     <marker id="arrow" markerWidth="18" markerHeight="18" refX="16" refY="9" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 18 9 0 18Z" fill="#087a51"/></marker>
     <style>
-      .title{font:700 50px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.subtitle{font:400 23px Inter,ui-sans-serif,system-ui,sans-serif;fill:#667788}.eye{font:700 19px Inter,ui-sans-serif,system-ui,sans-serif;letter-spacing:1.3px;fill:#334455}.label{font:700 28px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.meta{font:400 20px Inter,ui-sans-serif,system-ui,sans-serif;fill:#667788}.mono{font:600 18px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#334455}.small{font:600 19px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.white{fill:#fff}.pale{fill:#d9e2e7}
+      .title{font:700 50px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.subtitle{font:400 23px Inter,ui-sans-serif,system-ui,sans-serif;fill:#667788}.eye{font:700 19px Inter,ui-sans-serif,system-ui,sans-serif;letter-spacing:1.3px;fill:#334455}.label{font:700 28px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.meta{font:400 20px Inter,ui-sans-serif,system-ui,sans-serif;fill:#667788}.mono{font:600 18px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#334455}.flow{font:600 15px Inter,ui-sans-serif,system-ui,sans-serif;fill:#667788}.small{font:600 19px Inter,ui-sans-serif,system-ui,sans-serif;fill:#334455}.white{fill:#fff}.pale{fill:#d9e2e7}
     </style>
   </defs>
   <rect width="1600" height="860" fill="#f7f7f4"/>
   <text x="64" y="70" class="title">The bucket is the log</text>
-  <text x="64" y="112" class="subtitle">Applications share immutable objects and one committed catalog—not a broker process.</text>
+  <text x="64" y="112" class="subtitle">One writer commits immutable segments; any process can replay them directly from object storage.</text>
   <rect x="54" y="148" width="1492" height="650" rx="28" fill="#fff" filter="url(#shadow)"/>
 
   <text x="90" y="199" class="eye">WRITE</text>
@@ -21,7 +21,7 @@
   <text x="235" y="452" class="meta" text-anchor="middle">batch · seal · upload</text>
   <text x="235" y="487" class="mono" text-anchor="middle">partition 7</text>
   <path d="M380 405H474" fill="none" stroke="#087a51" stroke-width="6" marker-end="url(#arrow)"/>
-  <text x="427" y="384" class="meta" text-anchor="middle">publish</text>
+  <text x="427" y="384" class="meta" text-anchor="middle">commit</text>
 
   <text x="510" y="199" class="eye">DURABLE STATE</text>
   <rect x="500" y="225" width="590" height="390" rx="28" fill="#f5f8f7" stroke="#9fcab4" stroke-width="3"/>
@@ -38,21 +38,23 @@
   <text x="793" y="480" class="mono" text-anchor="middle">4096–8191</text><text x="793" y="512" class="meta" text-anchor="middle">segment</text>
   <text x="926" y="480" class="mono" text-anchor="middle">8192–…</text><text x="926" y="512" class="meta" text-anchor="middle">segment</text>
 
-  <path d="M1090 365H1180" fill="none" stroke="#087a51" stroke-width="6" marker-end="url(#arrow)"/>
-  <path d="M1090 490H1180" fill="none" stroke="#087a51" stroke-width="6" marker-end="url(#arrow)"/>
-  <text x="1135" y="344" class="meta" text-anchor="middle">discover</text>
-  <text x="1135" y="469" class="meta" text-anchor="middle">range-read</text>
+  <path d="M1090 344H1180" fill="none" stroke="#087a51" stroke-width="6" marker-end="url(#arrow)"/>
+  <path d="M1090 534H1180" fill="none" stroke="#087a51" stroke-width="6" marker-end="url(#arrow)"/>
+  <text x="1098" y="303" class="flow">LSN lookup</text>
+  <text x="1098" y="326" class="flow">range GET</text>
+  <text x="1098" y="493" class="flow">time lookup</text>
+  <text x="1098" y="516" class="flow">range GET</text>
 
   <text x="1216" y="199" class="eye">REPLAY</text>
   <rect x="1206" y="250" width="278" height="148" rx="22" fill="#e9f8ef" stroke="#5bcf80" stroke-width="3"/>
   <text x="1345" y="304" class="label" text-anchor="middle">Reader A</text>
   <text x="1345" y="344" class="mono" text-anchor="middle">from LSN 8,250</text>
   <text x="1345" y="373" class="meta" text-anchor="middle">independent process</text>
-  <rect x="1206" y="440" width="278" height="148" rx="22" fill="#fff2ed" stroke="#d97857" stroke-width="3"/>
+  <rect x="1206" y="440" width="278" height="148" rx="22" fill="#e9f8ef" stroke="#5bcf80" stroke-width="3"/>
   <text x="1345" y="494" class="label" text-anchor="middle">Reader B</text>
   <text x="1345" y="534" class="mono" text-anchor="middle">from timestamp T</text>
   <text x="1345" y="563" class="meta" text-anchor="middle">independent process</text>
 
   <rect x="90" y="683" width="1394" height="72" rx="16" fill="#dff3e7"/>
-  <text x="787" y="728" class="small" text-anchor="middle">The writer publishes reachability; readers fetch committed bytes directly from the bucket.</text>
+  <text x="787" y="728" class="small" text-anchor="middle">No broker in the read path: every reader opens the catalog and fetches committed blocks from the bucket.</text>
 </svg>

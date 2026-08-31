@@ -1,20 +1,22 @@
 ---
 title: "The Bucket Is the Log: Building an Append-Only Log on Object Storage in Go"
-description: "How UnisonDB's object-store WAL replication became objlog: immutable segments, a bounded catalog, fencing, and replay by LSN or timestamp."
+description: "Build an append-only log on object storage in Go using immutable segments, a bounded catalog, writer fencing, and replay by LSN or timestamp—without a broker."
 publishedAt: 2026-08-29
 tags: ["Go", "Object storage", "Distributed systems", "Storage engines", "Append-only logs"]
 draft: false
 featured: false
 socialImage: "/images/blog/building-an-append-only-log-on-object-storage-in-go/social.png"
-socialImageAlt: "A Go writer publishing immutable log segments and a bounded catalog into an object storage bucket for direct replay by LSN or timestamp."
+socialImageAlt: "One committed WAL branching into a direct gRPC path for a connected replica and an object-storage path for a polling replica with no direct writer connection."
 legacyUrls: []
 ---
 
 ## This started as a UnisonDB replication problem
 
-While building [UnisonDB](https://github.com/ankur-anand/unisondb), I already had a useful replication path. The active HA writer produced one committed WAL, and connected replicas could consume that WAL over gRPC.
+[UnisonDB](https://unisondb.io/) is a log-native streaming database. Its active HA writer already streamed committed WAL records over gRPC, allowing connected replicas to receive small batches quickly and apply them in order.
 
-gRPC was the right live path. A replica could stay connected, receive small batches quickly, and apply them in order. But I wanted the writer to publish the same committed WAL through object storage as well.
+The need for another path became concrete in March 2026, when a user opened [UnisonDB issue #208](https://github.com/ankur-anand/unisondb/issues/208). Their deployment had a centralized control-plane writer and read-only edge nodes, but establishing direct connectivity between them was difficult. They wanted S3, or an S3-compatible service, to act as the intermediate replication layer and were willing to accept the additional latency.
+
+That request exposed the boundary of the existing design. gRPC was the right path for live replication, but it required each replica to remain connected to the active writer. A disconnected or newly started replica still needed durable history it could replay without depending on that writer process. We therefore wanted the same committed WAL to be published through object storage as well.
 
 The second path was not meant to replace gRPC. It had a different job:
 
@@ -31,15 +33,19 @@ committed UnisonDB WAL -> one order --+
 ```
 
 <figure>
-  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/00-unisondb-dual-replication.svg" alt="A UnisonDB HA writer exposes one committed WAL through two replication paths: a live gRPC stream for connected replicas and immutable objlog segments in object storage for independently polling replicas, catch-up, and replay." width="1600" height="900" loading="lazy" decoding="async" />
-  <figcaption>One committed WAL feeds two transports: gRPC for the live path, object storage for durable fan-out and replay.</figcaption>
+  <img src="/images/blog/building-an-append-only-log-on-object-storage-in-go/00-unisondb-dual-replication.svg" alt="A UnisonDB HA writer feeds the same committed WAL to two replicas: one connected directly over gRPC and another polling a bounded catalog and immutable segments from object storage without connecting to the writer." width="1600" height="900" loading="lazy" decoding="async" />
+  <figcaption>A replica can follow the committed WAL through a direct gRPC stream or independently through object storage.</figcaption>
 </figure>
 
 The first idea was to upload UnisonDB's existing WAL segment files. That looked like reuse. It was actually the wrong storage boundary.
 
-## The local WAL segment was the wrong remote format
+## The local WAL was crash-safe—but it was the wrong remote format
 
-[UnisonDB's WAL](https://github.com/ankur-anand/unisondb/tree/main/pkg/walfs) is built for local disk. A segment is a preallocated memory-mapped file with a mutable 64-byte header followed by individually checksummed record frames:
+UnisonDB's WAL was built for local durability and streaming replication. [Building a Corruption-Proof Write-Ahead Log in Go](https://unisondb.io/blog/building-corruption-proof-write-ahead-log-in-go/) explains how checksummed records, a trailer marker, 8-byte-aligned frames, directory sync, and conservative recovery make incomplete or corrupted writes detectable before they are replayed locally or streamed to a follower.
+
+That design gives recovery and connected replicas an ordered sequence of complete, validated records. It solves the local WAL problem well. It does not make the segment a useful object-storage format.
+
+That format is implemented in [`pkg/walfs`](https://github.com/ankur-anand/unisondb/tree/main/pkg/walfs) and built for local disk. A segment is a preallocated memory-mapped file with a mutable 64-byte header followed by individually checksummed record frames:
 
 ```text
 +--------------------+----------------------+----------------------+-----+
@@ -50,7 +56,7 @@ The first idea was to upload UnisonDB's existing WAL segment files. That looked 
 record offsets -> in-memory index -> separate local index file
 ```
 
-That layout solves the local problems well. Appends are cheap, 8-byte-aligned frames work with the page cache, a trailer marker detects torn records, and recovery can scan until the first invalid frame.
+That layout solves its local problem well. Appends are cheap, checksums detect damaged records, the trailer distinguishes a finished record from an interrupted write, and recovery stops at the first frame it cannot validate.
 
 Uploading a sealed copy would preserve the bytes, but it would not create a useful remote log:
 
@@ -78,6 +84,20 @@ seek to LSN 8,250
   -> find one compressed block
   -> range-read and decode only that block
 ```
+
+We did not invent that shape from scratch. We took inspiration from immutable file formats that are also designed backward from their read path.
+
+A [LevelDB SSTable](https://github.com/google/leveldb/blob/main/doc/table_format.md) writes sorted, optionally compressed data blocks first, places an index after them, and ends with a fixed-size footer containing the location of that index. A reader starts at the footer, follows the index to one data block, and avoids scanning the complete file. [RocksDB's block-based tables](https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format) extend the same family of ideas with richer and partitioned indexes.
+
+[Apache Parquet](https://github.com/apache/parquet-format#file-format) applies a similar rule to a different workload. It writes file metadata after the column data, allowing a writer to produce the file in one pass. A reader examines the tail first, learns where the required column chunks live, and then reads only those ranges.
+
+```text
+LevelDB SSTable -> data blocks              -> index         -> fixed footer
+Parquet         -> column chunks            -> file metadata -> length + magic
+segformat       -> compressed record blocks -> block index   -> fixed trailer
+```
+
+The details are different, but the lesson transfers cleanly to object storage: for an immutable object, make the tail the entry point. A small range read should reveal the index, and the index should reveal the smallest data range that can answer the request.
 
 The resulting format is [`segformat` v2](https://github.com/ankur-anand/objlog/blob/main/internal/segformat/SPEC.md). One immutable object contains everything needed to validate and search it:
 
@@ -145,40 +165,6 @@ The object-store replication layer therefore grew into a reusable storage protoc
 </figure>
 
 This is not a smaller Kafka. It makes a different trade. Kafka provides live delivery, replicated brokers, and consumer-group coordination. `objlog` is for durable history that applications can reopen and replay from their own bucket.
-
-Let us run it before building the rest of the protocol.
-
-## Run the complete lifecycle
-
-The repository includes a demo backed by an in-process GCS emulator. It needs no cloud credentials and no Docker:
-
-```bash
-git clone https://github.com/ankur-anand/objlog.git
-cd objlog
-
-go run ./examples/demo -provider fake-gcs
-```
-
-The demo deliberately uses one record per segment so the objects are easy to count. A real writer batches many records into each segment.
-
-The shortened output shows the whole lifecycle:
-
-```text
-write       append 12 records, then flush 12 committed segments
-read        replay by LSN, seek by timestamp, fetch one exact LSN
-resume      persist a cursor checkpoint and continue without a gap
-tail        wait while another goroutine appends and flushes
-retention   advance oldestLSN; no object is deleted yet
-gc          delete unreachable objects after a grace period
-```
-
-The full demo ends with one useful fact:
-
-```text
-stored in   bucket objlog-demo and nowhere else — no broker, no local state
-```
-
-The emulator is only a provider. The same public API runs against MinIO, Azurite, and real cloud buckets.
 
 ## A valid segment is not yet a log
 
@@ -537,27 +523,6 @@ next, err := tailer.Next(ctx)
 
 The watch polls selected partitions on a configurable interval and bounds concurrent refreshes. Passive readers start no background loop. That distinction prevents a reader created for an occasional historical query from becoming an accidental permanent polling service.
 
-## Accepted work belongs to the writer
-
-The background publication pipeline creates a cancellation question similar to any shared asynchronous component.
-
-Suppose a caller invokes `Flush(ctx)` and its deadline expires while a segment upload is already underway. Should canceling that caller abandon records previously accepted by `Append`?
-
-It should not.
-
-The caller's context bounds the caller's wait. Accepted records belong to the writer's component context. Segment finalization and catalog publication continue until they succeed, reach configured operation timeouts, or the writer enters terminal shutdown.
-
-```text
-request context -> may stop waiting for Flush
-writer context  -> owns accepted segment work
-```
-
-If a graceful `Close` times out, a later `Close` can join the same drain. `Abort` makes the writer terminal, cancels component-owned work, cleans up what it can, and also lets later callers join the existing drain rather than starting a second shutdown race.
-
-The pipeline also preserves publication order. Detached segments may finish compression and upload out of order, but one publish worker advances the catalog in cut order. The next segment cannot be committed before the segment whose LSN range precedes it.
-
-These details are documented in the repository's [writer design](https://github.com/ankur-anand/objlog/blob/main/internal/writer/DESIGN.md).
-
 ## Retention changes reachability before it deletes bytes
 
 Deleting old history is another multi-object operation, so it uses the same separation between visibility and physical objects.
@@ -677,7 +642,7 @@ append
 
 The immutable objects carry the history. The catalog gives that history an order and a visibility boundary. The fence says who may extend it. Range indexes make it practical to reopen. Retention removes references first and bytes later.
 
-Back in UnisonDB, this gives the WAL two deliberate paths. gRPC remains the low-latency stream for connected replicas. The object-store path publishes the same order once so replicas can poll, catch up, or recover directly from durable history. The [MinIO replication example](https://github.com/ankur-anand/unisondb/tree/main/cmd/examples/blobstore-minio) exercises both the standalone writer and HA failover cases.
+The runnable [`objlog` examples](https://github.com/ankur-anand/objlog/tree/main/examples) exercise that complete lifecycle through the public API: write and flush records, replay by LSN or timestamp, resume from a cursor checkpoint, follow the live tail, advance retention, and reclaim unreachable objects. The same demo can run in-process with a fake GCS server or against MinIO and Azurite through Docker Compose.
 
 That is the central idea behind `objlog`:
 
@@ -685,12 +650,8 @@ That is the central idea behind `objlog`:
 
 Once that boundary is explicit, object storage stops looking like an inconvenient filesystem and starts looking like the durability layer the log was designed for.
 
-The complete implementation, format specifications, compatibility corpus, provider integrations, tests, and runnable demo are available in [`ankur-anand/objlog`](https://github.com/ankur-anand/objlog).
+The library is available at [`github.com/ankur-anand/objlog`](https://github.com/ankur-anand/objlog).
 
 ## References
 
-- [UnisonDB](https://github.com/ankur-anand/unisondb) is where the object-store WAL replication requirement began; its [blob-store replication example](https://github.com/ankur-anand/unisondb/tree/main/cmd/examples/blobstore-minio) shows producers and replicas using MinIO.
-- [`objlog`](https://github.com/ankur-anand/objlog) contains the complete implementation, local emulator demo, format corpora, fuzz targets, provider tests, and race tests.
 - The [usage guide](https://github.com/ankur-anand/objlog/blob/main/docs/usage.md) covers writer, reader, cursor, tailing, retention, lifecycle, and metrics APIs.
-- The [segment writer design](https://github.com/ankur-anand/objlog/blob/main/internal/segwriter/DESIGN.md) explains the streaming compression and multipart upload pipeline.
-- The [catalog format](https://github.com/ankur-anand/objlog/blob/main/internal/catalog/blob/SPEC.md) defines conditional publication, fencing, bounded pages, lookup, and copy-on-write retention.
